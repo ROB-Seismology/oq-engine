@@ -33,7 +33,7 @@ import openquake.nrmllib
 import openquake.hazardlib
 from openquake.hazardlib.gsim.base import GroundShakingIntensityModel
 
-from openquake.engine.db import models
+#from openquake.engine.db import models
 
 GSIM = openquake.hazardlib.gsim.get_available_gsims()
 
@@ -839,6 +839,7 @@ class SourceModelLogicTree(BaseLogicTree):
         Helper function to get a source model `Input` object from the database,
         for the given calculation and ``filename``.
         """
+        from openquake.engine.db import models
         source_model = models.inputs4hcalc(self.calc_id, 'source')
         [source_model] = source_model.filter(
             path=os.path.join(self.basepath, filename)
@@ -1019,6 +1020,7 @@ def read_logic_trees_from_db(calc_id, validate=True):
     :param int calc_id:
         ID of a :class:`openquake.engine.db.models.HazardCalculation`.
     """
+    from openquake.engine.db import models
     hc = models.HazardCalculation.objects.get(id=calc_id)
     [smlt] = models.inputs4hcalc(
         calc_id, input_type='source_model_logic_tree')
@@ -1049,7 +1051,21 @@ class LogicTreeProcessor(object):
     :param int calc_id:
         ID of a :class:`openquake.engine.db.models.HazardCalculation`.
     """
-    def __init__(self, calc_id):
+    def __init__(self, calc_id, source_model_lt=None, gmpe_lt=None):
+        if not calc_id is None:
+            self._init_from_calc_id(calc_id)
+        else:
+            self.source_model_lt = source_model_lt
+            self.gmpe_lt = gmpe_lt
+
+    def _init_from_calc_id(self, calc_id):
+        """
+        Initialize from calculation ID in the database.
+        The source-model and GMPE logic tree filenames are retrieved
+        from the database, parsed, and stored as source_model_lt and
+        gmpe_lt properties, respectively.
+        """
+        from openquake.engine.db import models
         [smlt_input] = models.inputs4hcalc(
             calc_id, input_type='source_model_logic_tree')
         smlt_content = smlt_input.model_content.raw_content_utf8
