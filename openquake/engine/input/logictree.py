@@ -373,6 +373,8 @@ class BaseLogicTree(object):
         parser = etree.XMLParser(schema=self.get_xmlschema())
         self.branches = {}
         self.open_ends = set()
+        if not content:
+            content = open(os.path.join(basepath, filename)).read()
         if isinstance(content, unicode):
             # etree.fromstring() refuses to parse unicode objects
             content = content.encode('latin1')
