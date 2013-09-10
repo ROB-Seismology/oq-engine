@@ -228,41 +228,42 @@ class BranchSet(object):
         be applied to it.
         """
         for key, value in self.filters.items():
-            if key == 'applyToTectonicRegionType':
-                if value != source.tectonic_region_type:
-                    return False
-            elif key == 'applyToSourceType':
-                if value == 'area':
-                    if not isinstance(source,
-                                      openquake.hazardlib.source.AreaSource):
+            if value:
+                if key == 'applyToTectonicRegionType':
+                    if value != source.tectonic_region_type:
                         return False
-                elif value == 'point':
-                    # area source extends point source
-                    if (not isinstance(
-                            source, openquake.hazardlib.source.PointSource)
-                        or isinstance(
-                            source, openquake.hazardlib.source.AreaSource)):
-                        return False
-                elif value == 'simpleFault':
-                    if not isinstance(
-                        source, openquake.hazardlib.source.SimpleFaultSource):
-                        return False
-                elif value == 'complexFault':
-                    if not isinstance(
-                        source, openquake.hazardlib.source.ComplexFaultSource):
-                        return False
-                elif value == 'characteristicFault':
-                    if not isinstance(
-                        source,
-                        openquake.hazardlib.source.CharacteristicFaultSource):
+                elif key == 'applyToSourceType':
+                    if value == 'area':
+                        if not isinstance(source,
+                                          openquake.hazardlib.source.AreaSource):
+                            return False
+                    elif value == 'point':
+                        # area source extends point source
+                        if (not isinstance(
+                                source, openquake.hazardlib.source.PointSource)
+                            or isinstance(
+                                source, openquake.hazardlib.source.AreaSource)):
+                            return False
+                    elif value == 'simpleFault':
+                        if not isinstance(
+                            source, openquake.hazardlib.source.SimpleFaultSource):
+                            return False
+                    elif value == 'complexFault':
+                        if not isinstance(
+                            source, openquake.hazardlib.source.ComplexFaultSource):
+                            return False
+                    elif value == 'characteristicFault':
+                        if not isinstance(
+                            source,
+                            openquake.hazardlib.source.CharacteristicFaultSource):
+                            return False
+                    else:
+                        raise AssertionError('unknown source type %r' % value)
+                elif key == 'applyToSources':
+                    if source.source_id not in value:
                         return False
                 else:
-                    raise AssertionError('unknown source type %r' % value)
-            elif key == 'applyToSources':
-                if source.source_id not in value:
-                    return False
-            else:
-                raise AssertionError('unknown filter %r' % key)
+                    raise AssertionError('unknown filter %r' % key)
         # All filters pass, return True.
         return True
 
@@ -291,6 +292,9 @@ class BranchSet(object):
         if not isinstance(source.mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
             # source's mfd is not gutenberg-richter
             return
+
+        if isinstance(value, dict):
+            value = value[source.source_id]
 
         self._apply_uncertainty_to_mfd(source.mfd, value)
 
@@ -495,6 +499,11 @@ class BaseLogicTree(object):
                                                 value_node.text.strip())
             value = self.parse_uncertainty_value(value_node, branchset,
                                                  value_node.text.strip())
+            if isinstance(value, list):
+                value_dict = {}
+                for i, src_id in enumerate(branchset.filters["applyToSources"]):
+                    value_dict[src_id] = value[i]
+                value = value_dict
             branch_id = branchnode.get('branchID')
             branch = Branch(branch_id, weight, value)
             if branch_id in self.branches:
@@ -635,7 +644,7 @@ class SourceModelLogicTree(BaseLogicTree):
         self.source_types = set()
         super(SourceModelLogicTree, self).__init__(*args, **kwargs)
 
-    def parse_uncertainty_value(self, node, branchset, value):
+    def parse_uncertainty_value(self, node, branchset, value_string):
         """
         See superclass' method for description and signature specification.
 
@@ -643,12 +652,20 @@ class SourceModelLogicTree(BaseLogicTree):
         pair of floats or a single float depending on uncertainty type.
         """
         if branchset.uncertainty_type == 'sourceModel':
-            return value
-        elif branchset.uncertainty_type == 'abGRAbsolute':
-            [a, b] = value.strip().split()
-            return float(a), float(b)
+            return value_string
         else:
-            return float(value)
+            value_columns = value_string.strip().split(';')
+            values = []
+            for valcol in value_columns:
+                if branchset.uncertainty_type == 'abGRAbsolute':
+                    [a, b] = valcol.strip().split()
+                    values.append((float(a), float(b)))
+                elif branchset.uncertainty_type == 'incrementalMFDRates':
+                    rates = valcol.strip().split()
+                    values.append(np.array(rates))
+                else:
+                    values.append(float(valcol))
+            return {True: values, False: values[0]}[len(values) > 1]
 
     def validate_uncertainty_value(self, node, branchset, value):
         """
