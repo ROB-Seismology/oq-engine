@@ -29,6 +29,8 @@ import re
 from decimal import Decimal
 from lxml import etree
 
+import numpy as np
+
 import openquake.nrmllib
 import openquake.hazardlib
 from openquake.hazardlib.gsim.base import GroundShakingIntensityModel
