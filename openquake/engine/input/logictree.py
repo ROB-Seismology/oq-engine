@@ -291,9 +291,9 @@ class BranchSet(object):
             # source didn't pass the filter
             return
 
-        if not isinstance(source.mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
+        #if not isinstance(source.mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
             # source's mfd is not gutenberg-richter
-            return
+        #    return
 
         if isinstance(value, dict):
             value = value[source.source_id]
@@ -304,21 +304,26 @@ class BranchSet(object):
         """
         Modify ``mfd`` object with uncertainty value ``value``.
         """
-        if self.uncertainty_type == 'abGRAbsolute':
-            a, b = value
-            mfd.modify('set_ab', dict(a_val=a, b_val=b))
+        if isinstance(mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
+            if self.uncertainty_type == 'abGRAbsolute':
+                a, b = value
+                mfd.modify('set_ab', dict(a_val=a, b_val=b))
 
-        elif self.uncertainty_type == 'bGRRelative':
-            mfd.modify('increment_b', dict(value=value))
+            elif self.uncertainty_type == 'bGRRelative':
+                mfd.modify('increment_b', dict(value=value))
 
-        elif self.uncertainty_type == 'maxMagGRRelative':
-            mfd.modify('increment_max_mag', dict(value=value))
+            elif self.uncertainty_type == 'maxMagGRRelative':
+                mfd.modify('increment_max_mag', dict(value=value))
 
-        elif self.uncertainty_type == 'maxMagGRAbsolute':
-            mfd.modify('set_max_mag', dict(value=value))
+            elif self.uncertainty_type == 'maxMagGRAbsolute':
+                mfd.modify('set_max_mag', dict(value=value))
+
+        elif isinstance(mfd, openquake.hazardlib.mfd.EvenlyDiscretizedMFD):
+            if self.uncertainty_type == 'incrementalMFDRates':
+                mfd.modify('set_occurrence_rates', dict(occurrence_rates=value))
 
         else:
-            raise AssertionError('unknown uncertainty type %r'
+            raise AssertionError('unknown or inappropriate uncertainty type %r'
                                  % self.uncertainty_type)
 
 
