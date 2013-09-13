@@ -507,6 +507,10 @@ class BaseLogicTree(object):
             value = self.parse_uncertainty_value(value_node, branchset,
                                                  value_node.text.strip())
             if isinstance(value, list):
+                if len(value) != len(branchset.filters["applyToSources"]):
+                    raise ValidationError(
+                        branchset_node, self.filename, self.basepath,
+                        "Number of values not equal to number of sources")
                 value_dict = {}
                 for i, src_id in enumerate(branchset.filters["applyToSources"]):
                     value_dict[src_id] = value[i]
