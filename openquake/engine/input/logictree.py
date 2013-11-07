@@ -698,26 +698,27 @@ class SourceModelLogicTree(BaseLogicTree):
         if branchset.uncertainty_type == 'sourceModel':
             self.collect_source_model_data(value)
 
-        elif branchset.uncertainty_type == 'abGRAbsolute':
-            ab_by_src = value.split(';')
-            for ab in ab_by_src:
-                ab = value.split()
-                if len(ab) == 2:
-                    a, b = ab
-                    if _float_re.match(a) and _float_re.match(b):
-                        return
-                raise ValidationError(
-                    node, self.filename, self.basepath,
-                    'expected a pair of floats separated by space'
-                )
-        elif branchset.uncertainty_type == 'incrementalMFDRates':
-            pass
         else:
-            if not _float_re.match(value):
-                raise ValidationError(
-                    node, self.filename, self.basepath,
-                    'expected single float value'
-                )
+            values_by_src = value.split(';')
+            for value in values_by_src:
+                if branchset.uncertainty_type == 'abGRAbsolute':
+                    ab = value.split()
+                    if len(ab) == 2:
+                        a, b = ab
+                        if _float_re.match(a) and _float_re.match(b):
+                            return
+                    raise ValidationError(
+                        node, self.filename, self.basepath,
+                        'expected a pair of floats separated by space'
+                    )
+                elif branchset.uncertainty_type == 'incrementalMFDRates':
+                    pass
+                else:
+                    if not _float_re.match(value):
+                        raise ValidationError(
+                            node, self.filename, self.basepath,
+                            'expected single float value'
+                        )
 
     def parse_filters(self, branchset_node, uncertainty_type, filters):
         """
