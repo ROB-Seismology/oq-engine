@@ -733,7 +733,7 @@ class SourceModelLogicTree(BaseLogicTree):
 
         * "sourceModel" uncertainties can not have filters.
         * Absolute uncertainties must have only one filter --
-          "applyToSources", with only one source id.
+          "applyToSources".
         * All other uncertainty types can have either no or one filter.
         * Filter "applyToSources" must mention only source ids that
           exist in source models.
@@ -780,12 +780,11 @@ class SourceModelLogicTree(BaseLogicTree):
                     )
 
         if uncertainty_type in ('abGRAbsolute', 'maxMagGRAbsolute'):
-            if not filters or not filters.keys() == ['applyToSources'] \
-                    or not len(filters['applyToSources'].split()) == 1:
+            if not filters or not filters.keys() == ['applyToSources']:
                 raise ValidationError(
                     branchset_node, self.filename, self.basepath,
                     "uncertainty of type %r must define 'applyToSources' "
-                    "with only one source id" % uncertainty_type
+                    "" % uncertainty_type
                 )
 
     def validate_branchset(self, branchset_node, depth, number, branchset):
