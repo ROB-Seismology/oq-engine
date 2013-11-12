@@ -29,11 +29,13 @@ import re
 from decimal import Decimal
 from lxml import etree
 
+import numpy as np
+
 import openquake.nrmllib
 import openquake.hazardlib
 from openquake.hazardlib.gsim.base import GroundShakingIntensityModel
 
-from openquake.engine.db import models
+#from openquake.engine.db import models
 
 GSIM = openquake.hazardlib.gsim.get_available_gsims()
 
@@ -228,41 +230,42 @@ class BranchSet(object):
         be applied to it.
         """
         for key, value in self.filters.items():
-            if key == 'applyToTectonicRegionType':
-                if value != source.tectonic_region_type:
-                    return False
-            elif key == 'applyToSourceType':
-                if value == 'area':
-                    if not isinstance(source,
-                                      openquake.hazardlib.source.AreaSource):
+            if value:
+                if key == 'applyToTectonicRegionType':
+                    if value != source.tectonic_region_type:
                         return False
-                elif value == 'point':
-                    # area source extends point source
-                    if (not isinstance(
-                            source, openquake.hazardlib.source.PointSource)
-                        or isinstance(
-                            source, openquake.hazardlib.source.AreaSource)):
-                        return False
-                elif value == 'simpleFault':
-                    if not isinstance(
-                        source, openquake.hazardlib.source.SimpleFaultSource):
-                        return False
-                elif value == 'complexFault':
-                    if not isinstance(
-                        source, openquake.hazardlib.source.ComplexFaultSource):
-                        return False
-                elif value == 'characteristicFault':
-                    if not isinstance(
-                        source,
-                        openquake.hazardlib.source.CharacteristicFaultSource):
+                elif key == 'applyToSourceType':
+                    if value == 'area':
+                        if not isinstance(source,
+                                          openquake.hazardlib.source.AreaSource):
+                            return False
+                    elif value == 'point':
+                        # area source extends point source
+                        if (not isinstance(
+                                source, openquake.hazardlib.source.PointSource)
+                            or isinstance(
+                                source, openquake.hazardlib.source.AreaSource)):
+                            return False
+                    elif value == 'simpleFault':
+                        if not isinstance(
+                            source, openquake.hazardlib.source.SimpleFaultSource):
+                            return False
+                    elif value == 'complexFault':
+                        if not isinstance(
+                            source, openquake.hazardlib.source.ComplexFaultSource):
+                            return False
+                    elif value == 'characteristicFault':
+                        if not isinstance(
+                            source,
+                            openquake.hazardlib.source.CharacteristicFaultSource):
+                            return False
+                    else:
+                        raise AssertionError('unknown source type %r' % value)
+                elif key == 'applyToSources':
+                    if source.source_id not in value:
                         return False
                 else:
-                    raise AssertionError('unknown source type %r' % value)
-            elif key == 'applyToSources':
-                if source.source_id not in value:
-                    return False
-            else:
-                raise AssertionError('unknown filter %r' % key)
+                    raise AssertionError('unknown filter %r' % key)
         # All filters pass, return True.
         return True
 
@@ -288,9 +291,12 @@ class BranchSet(object):
             # source didn't pass the filter
             return
 
-        if not isinstance(source.mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
+        #if not isinstance(source.mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
             # source's mfd is not gutenberg-richter
-            return
+        #    return
+
+        if isinstance(value, dict):
+            value = value[source.source_id]
 
         self._apply_uncertainty_to_mfd(source.mfd, value)
 
@@ -298,21 +304,26 @@ class BranchSet(object):
         """
         Modify ``mfd`` object with uncertainty value ``value``.
         """
-        if self.uncertainty_type == 'abGRAbsolute':
-            a, b = value
-            mfd.modify('set_ab', dict(a_val=a, b_val=b))
+        if isinstance(mfd, openquake.hazardlib.mfd.TruncatedGRMFD):
+            if self.uncertainty_type == 'abGRAbsolute':
+                a, b = value
+                mfd.modify('set_ab', dict(a_val=a, b_val=b))
 
-        elif self.uncertainty_type == 'bGRRelative':
-            mfd.modify('increment_b', dict(value=value))
+            elif self.uncertainty_type == 'bGRRelative':
+                mfd.modify('increment_b', dict(value=value))
 
-        elif self.uncertainty_type == 'maxMagGRRelative':
-            mfd.modify('increment_max_mag', dict(value=value))
+            elif self.uncertainty_type == 'maxMagGRRelative':
+                mfd.modify('increment_max_mag', dict(value=value))
 
-        elif self.uncertainty_type == 'maxMagGRAbsolute':
-            mfd.modify('set_max_mag', dict(value=value))
+            elif self.uncertainty_type == 'maxMagGRAbsolute':
+                mfd.modify('set_max_mag', dict(value=value))
+
+        elif isinstance(mfd, openquake.hazardlib.mfd.EvenlyDiscretizedMFD):
+            if self.uncertainty_type == 'incrementalMFDRates':
+                mfd.modify('set_occurrence_rates', dict(occurrence_rates=value))
 
         else:
-            raise AssertionError('unknown uncertainty type %r'
+            raise AssertionError('unknown or inappropriate uncertainty type %r'
                                  % self.uncertainty_type)
 
 
@@ -373,6 +384,8 @@ class BaseLogicTree(object):
         parser = etree.XMLParser(schema=self.get_xmlschema())
         self.branches = {}
         self.open_ends = set()
+        if not content:
+            content = open(os.path.join(basepath, filename)).read()
         if isinstance(content, unicode):
             # etree.fromstring() refuses to parse unicode objects
             content = content.encode('latin1')
@@ -493,6 +506,15 @@ class BaseLogicTree(object):
                                                 value_node.text.strip())
             value = self.parse_uncertainty_value(value_node, branchset,
                                                  value_node.text.strip())
+            if isinstance(value, list):
+                if len(value) != len(branchset.filters["applyToSources"]):
+                    raise ValidationError(
+                        branchset_node, self.filename, self.basepath,
+                        "Number of values not equal to number of sources")
+                value_dict = {}
+                for i, src_id in enumerate(branchset.filters["applyToSources"]):
+                    value_dict[src_id] = value[i]
+                value = value_dict
             branch_id = branchnode.get('branchID')
             branch = Branch(branch_id, weight, value)
             if branch_id in self.branches:
@@ -633,7 +655,7 @@ class SourceModelLogicTree(BaseLogicTree):
         self.source_types = set()
         super(SourceModelLogicTree, self).__init__(*args, **kwargs)
 
-    def parse_uncertainty_value(self, node, branchset, value):
+    def parse_uncertainty_value(self, node, branchset, value_string):
         """
         See superclass' method for description and signature specification.
 
@@ -641,12 +663,20 @@ class SourceModelLogicTree(BaseLogicTree):
         pair of floats or a single float depending on uncertainty type.
         """
         if branchset.uncertainty_type == 'sourceModel':
-            return value
-        elif branchset.uncertainty_type == 'abGRAbsolute':
-            [a, b] = value.strip().split()
-            return float(a), float(b)
+            return value_string
         else:
-            return float(value)
+            value_columns = value_string.strip().split(';')
+            values = []
+            for valcol in value_columns:
+                if branchset.uncertainty_type == 'abGRAbsolute':
+                    [a, b] = valcol.strip().split()
+                    values.append((float(a), float(b)))
+                elif branchset.uncertainty_type == 'incrementalMFDRates':
+                    rates = valcol.strip().split()
+                    values.append(np.array(rates))
+                else:
+                    values.append(float(valcol))
+            return {True: values, False: values[0]}[len(values) > 1]
 
     def validate_uncertainty_value(self, node, branchset, value):
         """
@@ -668,22 +698,27 @@ class SourceModelLogicTree(BaseLogicTree):
         if branchset.uncertainty_type == 'sourceModel':
             self.collect_source_model_data(value)
 
-        elif branchset.uncertainty_type == 'abGRAbsolute':
-            ab = value.split()
-            if len(ab) == 2:
-                a, b = ab
-                if _float_re.match(a) and _float_re.match(b):
-                    return
-            raise ValidationError(
-                node, self.filename, self.basepath,
-                'expected a pair of floats separated by space'
-            )
         else:
-            if not _float_re.match(value):
-                raise ValidationError(
-                    node, self.filename, self.basepath,
-                    'expected single float value'
-                )
+            values_by_src = value.split(';')
+            for value in values_by_src:
+                if branchset.uncertainty_type == 'abGRAbsolute':
+                    ab = value.split()
+                    if len(ab) == 2:
+                        a, b = ab
+                        if _float_re.match(a) and _float_re.match(b):
+                            return
+                    raise ValidationError(
+                        node, self.filename, self.basepath,
+                        'expected a pair of floats separated by space'
+                    )
+                elif branchset.uncertainty_type == 'incrementalMFDRates':
+                    pass
+                else:
+                    if not _float_re.match(value):
+                        raise ValidationError(
+                            node, self.filename, self.basepath,
+                            'expected single float value'
+                        )
 
     def parse_filters(self, branchset_node, uncertainty_type, filters):
         """
@@ -703,7 +738,7 @@ class SourceModelLogicTree(BaseLogicTree):
 
         * "sourceModel" uncertainties can not have filters.
         * Absolute uncertainties must have only one filter --
-          "applyToSources", with only one source id.
+          "applyToSources".
         * All other uncertainty types can have either no or one filter.
         * Filter "applyToSources" must mention only source ids that
           exist in source models.
@@ -750,12 +785,11 @@ class SourceModelLogicTree(BaseLogicTree):
                     )
 
         if uncertainty_type in ('abGRAbsolute', 'maxMagGRAbsolute'):
-            if not filters or not filters.keys() == ['applyToSources'] \
-                    or not len(filters['applyToSources'].split()) == 1:
+            if not filters or not filters.keys() == ['applyToSources']:
                 raise ValidationError(
                     branchset_node, self.filename, self.basepath,
                     "uncertainty of type %r must define 'applyToSources' "
-                    "with only one source id" % uncertainty_type
+                    "" % uncertainty_type
                 )
 
     def validate_branchset(self, branchset_node, depth, number, branchset):
@@ -839,6 +873,7 @@ class SourceModelLogicTree(BaseLogicTree):
         Helper function to get a source model `Input` object from the database,
         for the given calculation and ``filename``.
         """
+        from openquake.engine.db import models
         source_model = models.inputs4hcalc(self.calc_id, 'source')
         [source_model] = source_model.filter(
             path=os.path.join(self.basepath, filename)
@@ -1019,6 +1054,7 @@ def read_logic_trees_from_db(calc_id, validate=True):
     :param int calc_id:
         ID of a :class:`openquake.engine.db.models.HazardCalculation`.
     """
+    from openquake.engine.db import models
     hc = models.HazardCalculation.objects.get(id=calc_id)
     [smlt] = models.inputs4hcalc(
         calc_id, input_type='source_model_logic_tree')
@@ -1049,7 +1085,21 @@ class LogicTreeProcessor(object):
     :param int calc_id:
         ID of a :class:`openquake.engine.db.models.HazardCalculation`.
     """
-    def __init__(self, calc_id):
+    def __init__(self, calc_id, source_model_lt=None, gmpe_lt=None):
+        if not calc_id is None:
+            self._init_from_calc_id(calc_id)
+        else:
+            self.source_model_lt = source_model_lt
+            self.gmpe_lt = gmpe_lt
+
+    def _init_from_calc_id(self, calc_id):
+        """
+        Initialize from calculation ID in the database.
+        The source-model and GMPE logic tree filenames are retrieved
+        from the database, parsed, and stored as source_model_lt and
+        gmpe_lt properties, respectively.
+        """
+        from openquake.engine.db import models
         [smlt_input] = models.inputs4hcalc(
             calc_id, input_type='source_model_logic_tree')
         smlt_content = smlt_input.model_content.raw_content
