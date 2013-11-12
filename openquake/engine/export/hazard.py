@@ -136,18 +136,19 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
         else:
             # otherwise, we need to include logic tree branch info
             ltr = result.lt_realization
-            sm_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.sm_lt_path)
-            gsim_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.gsim_lt_path)
-            if ltr.weight is None:
-                # Monte-Carlo logic tree sampling
-                filename = '%s-smltp_%s-gsimltp_%s-ltr_%s.%s' % (
-                    output_type, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
-                )
-            else:
-                # End Branch Enumeration
-                filename = '%s-smltp_%s-gsimltp_%s.%s' % (
-                    output_type, sm_ltp, gsim_ltp, file_ext
-                )
+#            sm_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.sm_lt_path)
+#            gsim_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.gsim_lt_path)
+#            if ltr.weight is None:
+#                # Monte-Carlo logic tree sampling
+#                filename = '%s-smltp_%s-gsimltp_%s-ltr_%s.%s' % (
+#                    output_type, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
+#                )
+#            else:
+#                # End Branch Enumeration
+#                filename = '%s-smltp_%s-gsimltp_%s.%s' % (
+#                    output_type, sm_ltp, gsim_ltp, file_ext
+#                )
+            filename = '%s_%s.%s' % (output_type, ltr.ordinal, file_ext)
     elif output_type in ('gmf', 'ses'):
         # only logic trees, no stats
         ltr = result.lt_realization
@@ -165,6 +166,8 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
             )
     elif output_type == 'disagg_matrix':
         # only logic trees, no stats
+
+        out = '%s(%s)' % (output_type, result.poe)
         location = 'lon_%s-lat_%s' % (result.location.x, result.location.y)
 
         ltr = result.lt_realization
@@ -173,12 +176,12 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
         if ltr.weight is None:
             # Monte-Carlo logic tree sampling
             filename = '%s-%s-smltp_%s-gsimltp_%s-ltr_%s.%s' % (
-                output_type, location, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
+                out, location, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
             )
         else:
             # End Branch Enumeration
             filename = '%s-%s-smltp_%s-gsimltp_%s.%s' % (
-                output_type, location, sm_ltp, gsim_ltp, file_ext
+                out, location, sm_ltp, gsim_ltp, file_ext
             )
     else:
         filename = '%s.%s' % (output_type, file_ext)
@@ -297,6 +300,7 @@ def export_gmf_xml(output, target):
 
     writer = writers.EventBasedGMFXMLWriter(
         dest, sm_lt_path, gsim_lt_path)
+
     writer.serialize(gmf_coll)
 
     return dest
