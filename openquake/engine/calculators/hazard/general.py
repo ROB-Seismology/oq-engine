@@ -88,7 +88,6 @@ def store_site_model(input_mdl, site_model_source):
                              location=node.wkt,
                              input_id=input_mdl.id)
             for node in parser.parse()]
-    print data
     return writer.CacheInserter.saveall(data)
 
 
