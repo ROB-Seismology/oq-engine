@@ -89,7 +89,10 @@ CREATE TABLE hzrdi.site_model (
         CHECK(z1pt0 > 0.0),
     -- Depth to shear wave velocity of 2.5 km/s. Units km.
     z2pt5 float NOT NULL CONSTRAINT site_model_z2pt5
-        CHECK(z2pt5 > 0.0)
+        CHECK(z2pt5 > 0.0),
+    -- Kappa zero. In s.
+    kappa float NOT NULL CONSTRAINT site_model_kappa
+        CHECK(kappa > 0.0)
 ) TABLESPACE hzrdi_ts;
 SELECT AddGeometryColumn('hzrdi', 'site_model', 'location', 4326, 'POINT', 2);
 
@@ -273,6 +276,7 @@ CREATE TABLE uiapi.hazard_calculation (
                (reference_vs30_type IN ('measured', 'inferred')))),
     reference_depth_to_2pt5km_per_sec float,
     reference_depth_to_1pt0km_per_sec float,
+    reference_kappa float,
     -- calculation parameters:
     investigation_time float,
     intensity_measure_types_and_levels bytea NOT NULL,  -- stored as a pickled Python `dict`

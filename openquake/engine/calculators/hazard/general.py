@@ -84,9 +84,11 @@ def store_site_model(input_mdl, site_model_source):
                              vs30_type=node.vs30_type,
                              z1pt0=node.z1pt0,
                              z2pt5=node.z2pt5,
+                             kappa=node.kappa,
                              location=node.wkt,
                              input_id=input_mdl.id)
             for node in parser.parse()]
+    print data
     return writer.CacheInserter.saveall(data)
 
 

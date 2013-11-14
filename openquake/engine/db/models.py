@@ -425,14 +425,16 @@ class SiteModel(djm.Model):
     z1pt0 = djm.FloatField()
     # Depth to shear wave velocity of 2.5 km/s. Units km.
     z2pt5 = djm.FloatField()
+    # Kappa zero. Units s.
+    kappa = djm.FloatField()
     location = djm.PointField(srid=DEFAULT_SRID)
 
     def __repr__(self):
         return (
             'SiteModel(location="%s", vs30=%s, vs30_type=%s, z1pt0=%s, '
-            'z2pt5=%s)'
+            'z2pt5=%s, kappa=%s)'
             % (self.location.wkt, self.vs30, self.vs30_type, self.z1pt0,
-               self.z2pt5))
+               self.z2pt5, self.kappa))
 
     class Meta:
         db_table = 'hzrdi\".\"site_model'
@@ -782,6 +784,11 @@ class HazardCalculation(djm.Model):
         null=True,
         blank=True,
     )
+    reference_kappa = djm.FloatField(
+        help_text='Kappa zero. In s.',
+        null=True,
+        blank=True,
+    )
 
     #########################
     # Calculation parameters:
@@ -1065,14 +1072,16 @@ class HazardCalculation(djm.Model):
                 vs30 = smd.vs30
                 z1pt0 = smd.z1pt0
                 z2pt5 = smd.z2pt5
+                kappa = smd.kappa
             else:
                 vs30 = self.reference_vs30_value
                 measured = self.reference_vs30_type == 'measured'
                 z1pt0 = self.reference_depth_to_1pt0km_per_sec
                 z2pt5 = self.reference_depth_to_2pt5km_per_sec
+                kappa = self.reference_kappa
 
             sites.append(openquake.hazardlib.site.Site(
-                         pt, vs30, measured, z1pt0, z2pt5, hsite.id))
+                         pt, vs30, measured, z1pt0, z2pt5, kappa, hsite.id))
 
         sitecoll = SiteCollection.cache[self.id] = \
             SiteCollection(sites) if sites else None
