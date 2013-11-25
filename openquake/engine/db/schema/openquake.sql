@@ -92,7 +92,7 @@ CREATE TABLE hzrdi.site_model (
         CHECK(z2pt5 > 0.0),
     -- Kappa zero. In s.
     kappa float NOT NULL CONSTRAINT site_model_kappa
-        CHECK(kappa > 0.0)
+        CHECK(kappa >= 0.0)
 ) TABLESPACE hzrdi_ts;
 SELECT AddGeometryColumn('hzrdi', 'site_model', 'location', 4326, 'POINT', 2);
 
