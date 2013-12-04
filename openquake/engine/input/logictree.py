@@ -21,7 +21,6 @@ at https://blueprints.launchpad.net/openquake/+spec/openquake-logic-tree-module
 """
 
 import abc
-import StringIO
 import os
 import random
 import re
@@ -35,7 +34,6 @@ import openquake.nrmllib
 import openquake.hazardlib
 from openquake.hazardlib.gsim.base import GroundShakingIntensityModel
 
-#from openquake.engine.db import models
 
 GSIM = openquake.hazardlib.gsim.get_available_gsims()
 
@@ -340,8 +338,6 @@ class BaseLogicTree(object):
         Name of logic tree file, supposed to be relative to ``basepath``.
         That filename together with ``basepath`` are only used for reporting
         errors, the actual data is read from ``content``.
-    :param int calc_id:
-        ID of a :class:`openquake.engine.db.models.HazardCalculation`.
     :param validate:
         Boolean indicating whether or not the tree should be validated
         while parsed. This should be set to ``True`` on initial load
@@ -377,10 +373,9 @@ class BaseLogicTree(object):
                 file=openquake.nrmllib.nrml_schema_file())
         return cls._xmlschema
 
-    def __init__(self, content, basepath, filename, calc_id, validate=True):
+    def __init__(self, content, basepath, filename, validate=True):
         self.basepath = basepath
         self.filename = filename
-        self.calc_id = calc_id
         parser = etree.XMLParser(schema=self.get_xmlschema())
         self.branches = {}
         self.open_ends = set()
@@ -868,19 +863,10 @@ class SourceModelLogicTree(BaseLogicTree):
             super(SourceModelLogicTree, self).apply_branchset(branchset_node,
                                                               branchset)
 
-    def _get_source_model(self, filename):
-        """
-        Helper function to get a source model `Input` object from the database,
-        for the given calculation and ``filename``.
-        """
-        from openquake.engine.db import models
-        source_model = models.inputs4hcalc(self.calc_id, 'source')
-        [source_model] = source_model.filter(
-            path=os.path.join(self.basepath, filename)
-        )
-        return source_model
+    def _get_source_model(self, source_model_file):
+        return file(os.path.join(self.basepath, source_model_file))
 
-    def collect_source_model_data(self, filename):
+    def collect_source_model_data(self, source_model):
         """
         Parse source model file and collect information about source ids,
         source types and tectonic region types available in it. That
@@ -891,8 +877,7 @@ class SourceModelLogicTree(BaseLogicTree):
                                for tagname in self.SOURCE_TYPES)
         sourcetype_slice = slice(len('{%s}' % self.NRML), - len('Source'))
 
-        source_model = self._get_source_model(filename)
-        fh = StringIO.StringIO(source_model.model_content.raw_content)
+        fh = self._get_source_model(source_model)
         eventstream = etree.iterparse(fh, tag='{%s}*' % self.NRML,
                                       schema=self.get_xmlschema())
         while True:
@@ -901,7 +886,7 @@ class SourceModelLogicTree(BaseLogicTree):
             except StopIteration:
                 break
             except etree.XMLSyntaxError as exc:
-                raise ParsingError(filename, self.basepath, str(exc))
+                raise ParsingError(source_model, self.basepath, str(exc))
             if not node.tag in all_source_types:
                 continue
             self.tectonic_region_types.add(node.attrib['tectonicRegion'])
@@ -1039,83 +1024,53 @@ class GMPELogicTree(BaseLogicTree):
             )
 
 
-def read_logic_trees_from_db(calc_id, validate=True):
+def read_logic_trees(hc, validate=True):
     """
-    The same idea as :func:`read_logic_trees_from_fs`, except all input files
-    are expected to be preloaded in the database first. Nothing should touch
-    the file system.
-
-    NOTE: This was kind of added a hack in order to decouple logic trees from
-    the file system.
-
     :param bool validate:
         Defaults to `True`. If `True`, do a full validation when reading the
         logic trees.
-    :param int calc_id:
-        ID of a :class:`openquake.engine.db.models.HazardCalculation`.
+    :param hc:
+        a :class:`openquake.engine.db.models.HazardCalculation`.
     """
-    from openquake.engine.db import models
-    hc = models.HazardCalculation.objects.get(id=calc_id)
-    [smlt] = models.inputs4hcalc(
-        calc_id, input_type='source_model_logic_tree')
-    [gsimlt] = models.inputs4hcalc(
-        calc_id, input_type='gsim_logic_tree')
+    smlt_file = hc.inputs['source_model_logic_tree']
+    gsimlt_file = hc.inputs['gsim_logic_tree']
 
-    smlt_file = smlt.model_content.as_string_io
-    gsimlt_file = gsimlt.model_content.as_string_io
-
-    smlt_content = smlt_file.read()
     smlt = SourceModelLogicTree(
-        smlt_content, hc.base_path, smlt.path, calc_id,
-        validate=validate
-    )
-    gsimlt_content = gsimlt_file.read()
+        file(smlt_file).read(), hc.base_path, smlt_file, validate=validate)
     GMPELogicTree(
-        smlt.tectonic_region_types, gsimlt_content, hc.base_path,
-        gsimlt.path, calc_id, validate=validate
-    )
+        smlt.tectonic_region_types, file(gsimlt_file).read(), hc.base_path,
+        gsimlt_file, validate=validate)
     return [branch.value for branch in smlt.root_branchset.branches]
 
 
 class LogicTreeProcessor(object):
     """
     Logic tree processor. High-level interface to dealing with logic trees
-    that are already in the database.
 
-    :param int calc_id:
-        ID of a :class:`openquake.engine.db.models.HazardCalculation`.
+    :param str smlt_content:
+        the content of the source model logic tree
+        (or object behaving linke :class:`SourceModelLogicTree`)
+    :param str gmpelt_content:
+        the content of the gmpe logic tree
+        (or object behaving like :class:`GMPELogicTree`)
     """
-    def __init__(self, calc_id, source_model_lt=None, gmpe_lt=None):
-        if not calc_id is None:
-            self._init_from_calc_id(calc_id)
+    def __init__(self, smlt_content, gmpelt_content):
+        if isinstance(smlt_content, str):
+            self.source_model_lt = SourceModelLogicTree(
+                smlt_content, basepath=None, filename=None, validate=False)
         else:
-            self.source_model_lt = source_model_lt
-            self.gmpe_lt = gmpe_lt
+            self.source_model_lt = smlt_content
+        if isinstance(gmpelt_content, str):
+            self.gmpe_lt = GMPELogicTree(
+                tectonic_region_types=[], content=gmpelt_content,
+                basepath=None, filename=None, validate=False)
+        else:
+            self.gmpe_lt = gmpelt_content
 
-    def _init_from_calc_id(self, calc_id):
-        """
-        Initialize from calculation ID in the database.
-        The source-model and GMPE logic tree filenames are retrieved
-        from the database, parsed, and stored as source_model_lt and
-        gmpe_lt properties, respectively.
-        """
-        from openquake.engine.db import models
-        [smlt_input] = models.inputs4hcalc(
-            calc_id, input_type='source_model_logic_tree')
-        smlt_content = smlt_input.model_content.raw_content
-
-        [gmpelt_input] = models.inputs4hcalc(
-            calc_id, input_type='gsim_logic_tree')
-        gmpelt_content = gmpelt_input.model_content.raw_content
-
-        self.source_model_lt = SourceModelLogicTree(
-            smlt_content, basepath=None, filename=None, calc_id=calc_id,
-            validate=False
-        )
-        self.gmpe_lt = GMPELogicTree(
-            tectonic_region_types=[], content=gmpelt_content,
-            basepath=None, filename=None, calc_id=calc_id, validate=False
-        )
+    @classmethod
+    def from_hc(cls, hc):
+        return cls(file(hc.inputs['source_model_logic_tree']).read(),
+                   file(hc.inputs['gsim_logic_tree']).read())
 
     def sample_source_model_logictree(self, random_seed):
         """
@@ -1209,7 +1164,7 @@ class LogicTreeProcessor(object):
         def apply_uncertainties(source):
             for branchset, value in branchsets_and_uncertainties:
                 branchset.apply_uncertainty(value, source)
-
+            return source
         return apply_uncertainties
 
     def parse_gmpe_logictree_path(self, branch_ids):

@@ -32,14 +32,13 @@ from openquake.engine.calculators import post_processing
 from openquake.engine.calculators.risk import (
     base, hazard_getters, validation, writers)
 from openquake.engine.db import models
-from openquake.engine.utils import tasks
 from openquake.engine import logs, writer
+from openquake.engine.input import logictree
 from openquake.engine.performance import EnginePerformanceMonitor
-from openquake.engine.calculators.base import signal_task_complete
+from openquake.engine.utils import tasks
 
 
 @tasks.oqtask
-@base.count_progress_risk('r')
 def event_based(job_id, units, containers, params):
     """
     Celery task for the event based risk calculator.
@@ -54,27 +53,22 @@ def event_based(job_id, units, containers, params):
     :param params:
       An instance of :class:`..base.CalcParams` used to compute
       derived outputs
+    :returns:
+      A dictionary {loss_type: event_loss_table}
     """
-
-    def profile(name):
-        return EnginePerformanceMonitor(
-            name, job_id, event_based, tracing=True)
+    monitor = EnginePerformanceMonitor(
+        None, job_id, event_based, tracing=True)
 
     # Do the job in other functions, such that they can be unit tested
     # without the celery machinery
     event_loss_tables = dict()
 
-    with db.transaction.commit_on_success(using='reslt_writer'):
+    with db.transaction.commit_on_success(using='job_init'):
         for unit in units:
             event_loss_tables[unit.loss_type] = do_event_based(
-                unit,
-                containers.with_args(loss_type=unit.loss_type),
-                params, profile)
-    num_items = base.get_num_items(units)
-    signal_task_complete(job_id=job_id,
-                         num_items=num_items,
-                         event_loss_tables=event_loss_tables)
-event_based.ignore_result = False
+                unit, containers.with_args(loss_type=unit.loss_type),
+                params, monitor.copy)
+    return event_loss_tables
 
 
 def do_event_based(unit, containers, params, profile):
@@ -144,14 +138,16 @@ def save_individual_outputs(containers, outputs, disagg_outputs, params):
         output_type="loss_map")
 
     if disagg_outputs is not None:
+        # FIXME. We should avoid synthetizing the generator
+        assets = list(disagg_outputs.assets_disagg)
         containers.write(
-            disagg_outputs.assets_disagg,
+            assets,
             disagg_outputs.magnitude_distance,
             disagg_outputs.fractions,
             output_type="loss_fraction",
             variable="magnitude_distance")
         containers.write(
-            disagg_outputs.assets_disagg,
+            assets,
             disagg_outputs.coordinate, disagg_outputs.fractions,
             output_type="loss_fraction",
             variable="coordinate")
@@ -243,7 +239,6 @@ def disaggregate(outputs, rupture_ids, params):
     """
     def disaggregate_site(site, loss_ratios):
         for fraction, rupture_id in zip(loss_ratios, rupture_ids):
-
             rupture = models.SESRupture.objects.get(pk=rupture_id)
             s = rupture.surface
             m = mesh.Mesh(numpy.array([site.x]), numpy.array([site.y]), None)
@@ -264,7 +259,16 @@ def disaggregate(outputs, rupture_ids, params):
     for asset, losses in zip(outputs.assets, outputs.loss_matrix):
         if asset.site in params.sites_disagg:
             disagg_matrix.extend(list(disaggregate_site(asset.site, losses)))
-            assets_disagg.append(asset)
+
+            # FIXME. the functions in
+            # openquake.engine.calculators.risk.writers requires an
+            # asset per each row in the disaggregation matrix. To this
+            # aim, we repeat the assets that will be passed to such
+            # functions
+            assets_disagg = itertools.chain(
+                assets_disagg,
+                itertools.repeat(asset, len(rupture_ids)))
+
     if assets_disagg:
         magnitudes, coordinates, fractions = zip(*disagg_matrix)
     else:
@@ -310,12 +314,13 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         self.hazard_seeds = [rnd.randint(0, models.MAX_SINT_32)
                              for _ in self.rc.hazard_outputs()]
 
-    def task_completed_hook(self, message):
+    def task_completed(self, event_loss_tables):
         """
         Updates the event loss table
         """
+        self.log_percent(event_loss_tables)
         for loss_type in models.loss_types(self.risk_models):
-            task_loss_table = message['event_loss_tables'][loss_type]
+            task_loss_table = event_loss_tables[loss_type]
             self.event_loss_tables[loss_type] += task_loss_table
 
     def post_process(self):
@@ -396,6 +401,13 @@ class EventBasedRiskCalculator(base.RiskCalculator):
 
         time_span, tses = self.hazard_times()
 
+        # If we are computing ground motion values on the fly we need
+        # logic trees
+        if self.rc.hazard_outputs()[0].output_type == "ses":
+            ltp = logictree.LogicTreeProcessor.from_hc(self.rc)
+        else:
+            ltp = None
+
         return workflows.CalculationUnit(
             loss_type,
             workflows.ProbabilisticEventBased(
@@ -411,7 +423,8 @@ class EventBasedRiskCalculator(base.RiskCalculator):
                 assets,
                 self.rc.best_maximum_distance,
                 risk_model.imt,
-                self.hazard_seeds))
+                self.hazard_seeds,
+                ltp))
 
     def hazard_times(self):
         """
@@ -419,8 +432,8 @@ class EventBasedRiskCalculator(base.RiskCalculator):
         motion field and the so-called time representative of the
         stochastic event set
         """
-        time_span = self.hc.investigation_time
-        return time_span, self.hc.ses_per_logic_tree_path * time_span
+        return (self.rc.investigation_time,
+                self.hc.ses_per_logic_tree_path * self.hc.investigation_time)
 
     @property
     def calculator_parameters(self):

@@ -17,74 +17,16 @@
 import getpass
 import unittest
 import mock
-import zlib
 
 import numpy
 
 from nose.plugins.attrib import attr
 
-from openquake.engine import engine
 from openquake.engine.calculators.hazard.classical import core as cls_core
 from openquake.engine.calculators.hazard.scenario import core as scen_core
 from openquake.engine.db import models
 
 from tests.utils import helpers
-from tests.utils.helpers import get_data_path
-
-
-class Inputs4HazCalcTestCase(unittest.TestCase):
-
-    def test_no_inputs(self):
-        self.assertEqual([], list(models.inputs4hcalc(-1)))
-
-    def test_a_few_inputs(self):
-        cfg = helpers.get_data_path('simple_fault_demo_hazard/job.ini')
-        params, files = engine.parse_config(open(cfg, 'r'))
-        owner = helpers.default_user()
-        hc = engine.create_hazard_calculation(
-            owner.user_name, params, files
-        )
-
-        inputs = models.inputs4hcalc(hc.id)
-        # We expect 3: the two logic trees and one source model
-        self.assertEqual(3, inputs.count())
-
-    def test_with_input_type(self):
-        cfg = helpers.get_data_path('simple_fault_demo_hazard/job.ini')
-        params, files = engine.parse_config(open(cfg, 'r'))
-        owner = helpers.default_user()
-        hc = engine.create_hazard_calculation(
-            owner.user_name, params, files
-        )
-
-        inputs = models.inputs4hcalc(
-            hc.id, input_type='source_model_logic_tree'
-        )
-        self.assertEqual(1, inputs.count())
-
-
-class Inputs4RiskCalcTestCase(unittest.TestCase):
-
-    def test_no_inputs(self):
-        self.assertEqual([], list(models.inputs4rcalc(-1)))
-
-    def test_a_few_inputs(self):
-        job, files = helpers.get_fake_risk_job(
-            get_data_path('classical_psha_based_risk/job.ini'),
-            get_data_path('simple_fault_demo_hazard/job.ini'))
-        rc = job.risk_calculation
-
-        inputs = models.inputs4rcalc(rc.id)
-        self.assertEqual(2, inputs.count())
-
-    def test_with_input_type(self):
-        job, files = helpers.get_fake_risk_job(
-            get_data_path('classical_psha_based_risk/job.ini'),
-            get_data_path('simple_fault_demo_hazard/job.ini'))
-        rc = job.risk_calculation
-
-        inputs = models.inputs4rcalc(rc.id, input_type='exposure')
-        self.assertEqual(1, inputs.count())
 
 
 class HazardCalculationGeometryTestCase(unittest.TestCase):
@@ -92,7 +34,7 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
 
     def test_sites_from_wkt(self):
         # should succeed with no errors
-        hjp = models.HazardCalculation(sites='MULTIPOINT(1 2, 3 4)')
+        hjp = models.HazardCalculation.create(sites='MULTIPOINT(1 2, 3 4)')
         expected_wkt = (
             'MULTIPOINT (1.0000000000000000 2.0000000000000000,'
             ' 3.0000000000000000 4.0000000000000000)'
@@ -101,13 +43,15 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
         self.assertEqual(expected_wkt, hjp.sites.wkt)
 
     def test_sites_invalid_str(self):
-        self.assertRaises(ValueError, models.HazardCalculation, sites='a 5')
+        self.assertRaises(
+            ValueError, models.HazardCalculation.create, sites='a 5')
 
     def test_sites_odd_num_of_coords_in_str_list(self):
-        self.assertRaises(ValueError, models.HazardCalculation, sites='1 2, 3')
+        self.assertRaises(
+            ValueError, models.HazardCalculation.create, sites='1 2, 3')
 
     def test_sites_valid_str_list(self):
-        hjp = models.HazardCalculation(sites='1 2, 3 4')
+        hjp = models.HazardCalculation.create(sites='1 2, 3 4')
         expected_wkt = (
             'MULTIPOINT (1.0000000000000000 2.0000000000000000,'
             ' 3.0000000000000000 4.0000000000000000)'
@@ -116,7 +60,8 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
         self.assertEqual(expected_wkt, hjp.sites.wkt)
 
     def test_region_from_wkt(self):
-        hjp = models.HazardCalculation(region='POLYGON((1 2, 3 4, 5 6, 1 2))')
+        hjp = models.HazardCalculation.create(
+            region='POLYGON((1 2, 3 4, 5 6, 1 2))')
         expected_wkt = (
             'POLYGON ((1.0000000000000000 2.0000000000000000, '
             '3.0000000000000000 4.0000000000000000, '
@@ -128,19 +73,20 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
 
     def test_region_invalid_str(self):
         self.assertRaises(
-            ValueError, models.HazardCalculation,
+            ValueError, models.HazardCalculation.create,
             region='0, 0, 5a 5, 1, 3, 0, 0'
         )
 
     def test_region_odd_num_of_coords_in_str_list(self):
         self.assertRaises(
-            ValueError, models.HazardCalculation, region='1 2, 3 4, 5 6, 1'
+            ValueError, models.HazardCalculation.create,
+            region='1 2, 3 4, 5 6, 1'
         )
 
     def test_region_valid_str_list(self):
         # note that the last coord (with closes the ring) can be ommitted
         # in this case
-        hjp = models.HazardCalculation(region='1 2, 3 4, 5 6')
+        hjp = models.HazardCalculation.create(region='1 2, 3 4, 5 6')
         expected_wkt = (
             'POLYGON ((1.0000000000000000 2.0000000000000000, '
             '3.0000000000000000 4.0000000000000000, '
@@ -151,10 +97,10 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
         self.assertEqual(expected_wkt, hjp.region.wkt)
 
     def test_points_to_compute_none(self):
-        hc = models.HazardCalculation()
+        hc = models.HazardCalculation.create()
         self.assertIsNone(hc.points_to_compute())
 
-        hc = models.HazardCalculation(region='1 2, 3 4, 5 6')
+        hc = models.HazardCalculation.create(region='1 2, 3 4, 5 6')
         # There's no region grid spacing
         self.assertIsNone(hc.points_to_compute())
 
@@ -193,7 +139,7 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
             45.96040703644873, 45.96040703644873,
         ]
 
-        hc = models.HazardCalculation(
+        hc = models.HazardCalculation.create(
             region='6.5 45.8, 6.5 46.5, 8.5 46.5, 8.5 45.8',
             region_grid_spacing=20)
         mesh = hc.points_to_compute(save_sites=False)
@@ -204,7 +150,7 @@ class HazardCalculationGeometryTestCase(unittest.TestCase):
     def test_points_to_compute_sites(self):
         lons = [6.5, 6.5, 8.5, 8.5]
         lats = [45.8, 46.5, 46.5, 45.8]
-        hc = models.HazardCalculation(
+        hc = models.HazardCalculation.create(
             sites='6.5 45.8, 6.5 46.5, 8.5 46.5, 8.5 45.8')
 
         mesh = hc.points_to_compute(save_sites=False)
@@ -224,8 +170,7 @@ class SESRuptureTestCase(unittest.TestCase):
             hazard_calculation=job.hazard_calculation, ordinal=0, seed=0,
             sm_lt_path='foo', gsim_lt_path='bar', total_items=0)
         output = models.Output.objects.create(
-            oq_job=job, owner=job.owner, display_name='test',
-            output_type='ses')
+            oq_job=job, display_name='test', output_type='ses')
         ses_coll = models.SESCollection.objects.create(
             output=output, lt_realization=lt_rlz)
         ses = models.SES.objects.create(
@@ -244,7 +189,7 @@ class SESRuptureTestCase(unittest.TestCase):
         self.ps_depths = [0.1, 0.2, 0.3, 0.4]
 
         self.fault_rupture = models.SESRupture.objects.create(
-            ses=ses, old_magnitude=5, old_strike=0, old_dip=0, old_rake=0,
+            ses=ses, magnitude=5, old_strike=0, old_dip=0, old_rake=0,
             old_tectonic_region_type='Active Shallow Crust',
             old_is_from_fault_source=True, old_lons=self.mesh_lons,
             old_is_multi_surface=False,
@@ -355,9 +300,6 @@ class GmfsPerSesTestCase(unittest.TestCase):
         gmf_data2 = helpers.create_gmf_data_records(
             job, rlz2, ses_coll2, points)[0]
         cls.gmf_coll1 = gmf_data1.gmf
-        cls.parent_coll = models.Gmf.objects.create(
-            output=models.Output.objects.create_output(
-                job, "Test Hazard output", "complete_lt_gmf"))
         cls.ruptures1 = tuple(get_tags(gmf_data1))
         cls.ruptures2 = tuple(get_tags(gmf_data2))
         cls.investigation_time = job.hazard_calculation.investigation_time
@@ -388,51 +330,6 @@ GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
 <X= 15.71000, Y= 37.22500, GMV=0.3000000>))""" % (
             (self.investigation_time, gmfs.stochastic_event_set_id) +
             self.ruptures1)
-        self.assertEqual(str(gmfs), expected)
-
-    def test_complete_lt(self):
-        all_gmfs = list(self.parent_coll)
-        self.assertEqual(len(all_gmfs), 1)
-        gmfs = all_gmfs[0]
-        expected = """\
-GMFsPerSES(investigation_time=100.000000, stochastic_event_set_id=1,
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.31000, Y= 38.22500, GMV=0.1000000>
-<X= 15.48000, Y= 38.09100, GMV=0.1000000>
-<X= 15.48100, Y= 38.25000, GMV=0.1000000>
-<X= 15.56500, Y= 38.17000, GMV=0.1000000>
-<X= 15.71000, Y= 37.22500, GMV=0.1000000>)
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.31000, Y= 38.22500, GMV=0.2000000>
-<X= 15.48000, Y= 38.09100, GMV=0.2000000>
-<X= 15.48100, Y= 38.25000, GMV=0.2000000>
-<X= 15.56500, Y= 38.17000, GMV=0.2000000>
-<X= 15.71000, Y= 37.22500, GMV=0.2000000>)
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.31000, Y= 38.22500, GMV=0.3000000>
-<X= 15.48000, Y= 38.09100, GMV=0.3000000>
-<X= 15.48100, Y= 38.25000, GMV=0.3000000>
-<X= 15.56500, Y= 38.17000, GMV=0.3000000>
-<X= 15.71000, Y= 37.22500, GMV=0.3000000>)
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.20000, Y= 38.20000, GMV=0.1000000>
-<X= 15.30000, Y= 38.22000, GMV=0.1000000>
-<X= 15.40000, Y= 38.09000, GMV=0.1000000>
-<X= 15.56000, Y= 38.10000, GMV=0.1000000>
-<X= 15.70000, Y= 37.22000, GMV=0.1000000>)
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.20000, Y= 38.20000, GMV=0.2000000>
-<X= 15.30000, Y= 38.22000, GMV=0.2000000>
-<X= 15.40000, Y= 38.09000, GMV=0.2000000>
-<X= 15.56000, Y= 38.10000, GMV=0.2000000>
-<X= 15.70000, Y= 37.22000, GMV=0.2000000>)
-GMF(imt=PGA sa_period=None sa_damping=None rupture_id=%s
-<X= 15.20000, Y= 38.20000, GMV=0.3000000>
-<X= 15.30000, Y= 38.22000, GMV=0.3000000>
-<X= 15.40000, Y= 38.09000, GMV=0.3000000>
-<X= 15.56000, Y= 38.10000, GMV=0.3000000>
-<X= 15.70000, Y= 37.22000, GMV=0.3000000>))""" % (
-            self.ruptures1 + self.ruptures2)
         self.assertEqual(str(gmfs), expected)
 
 
@@ -473,8 +370,8 @@ class GetSiteCollectionTestCase(unittest.TestCase):
         calc = cls_core.ClassicalHazardCalculator(job)
 
         # Bootstrap the `hazard_site` table:
-        calc.initialize_sources()
         calc.initialize_site_model()
+        calc.initialize_sources()
 
         site_coll = job.hazard_calculation.site_collection
         # Since we're using a pretty big site model, it's a bit excessive to
@@ -541,14 +438,3 @@ class LossFractionTestCase(unittest.TestCase):
                          lf.display_value("7, 21", rc))
         self.assertEqual("0.0000,0.5000|0.0000,0.5000",
                          lf.display_value("0.0, 0.0", rc))
-
-
-class ModelContentTestCase(unittest.TestCase):
-    def test_compress_decompress(self):
-        # test the gzip functionality for the raw_content field
-        xml = u'<nrml>così</nrml>'.encode('utf-8')
-        mc = models.ModelContent(
-            raw_content=zlib.compress(xml), content_type='text/xml')
-        mc.save()  # calls GzippedField.get_prep_value
-        saved = models.ModelContent.objects.get(pk=mc.id)
-        self.assertEqual(saved.raw_content, xml)

@@ -21,41 +21,21 @@ import openquake.hazardlib
 import openquake.hazardlib.calc
 import openquake.hazardlib.imt
 
-from django.db import transaction
-
 from openquake.engine import logs
-from openquake.engine.calculators import base
 from openquake.engine.calculators.hazard import general as haz_general
 from openquake.engine.calculators.hazard.classical import (
     post_processing as post_proc)
 from openquake.engine.db import models
-from openquake.engine.input import logictree
-from openquake.engine.utils import stats
 from openquake.engine.utils import tasks as utils_tasks
 from openquake.engine.performance import EnginePerformanceMonitor
 
+# FIXME: the following import must go after the openquake.engine.db import
+# so that the variable DJANGO_SETTINGS_MODULE is properly set
+from django.db import transaction
+
 
 @utils_tasks.oqtask
-@stats.count_progress('h')
-def hazard_curves(job_id, src_ids, lt_rlz_id):
-    """
-    A celery task wrapper function around :func:`compute_hazard_curves`.
-    See :func:`compute_hazard_curves` for parameter definitions.
-    """
-    logs.LOG.debug('> starting task: job_id=%s, lt_realization_id=%s'
-                   % (job_id, lt_rlz_id))
-
-    compute_hazard_curves(job_id, src_ids, lt_rlz_id)
-    # Last thing, signal back the control node to indicate the completion of
-    # task. The control node needs this to manage the task distribution and
-    # keep track of progress.
-    logs.LOG.debug('< task complete, signalling completion')
-    base.signal_task_complete(job_id=job_id, num_items=len(src_ids))
-
-
-# Silencing 'Too many local variables'
-# pylint: disable=R0914
-def compute_hazard_curves(job_id, src_ids, lt_rlz_id):
+def compute_hazard_curves(job_id, sources, lt_rlz_id, ltp):
     """
     Celery task for hazard curve calculator.
 
@@ -66,31 +46,22 @@ def compute_hazard_curves(job_id, src_ids, lt_rlz_id):
     transaction, to prevent race conditions) in the
     `htemp.hazard_curve_progress` table.
 
-    Once all of this work is complete, a signal will be sent via AMQP to let
-    the control node know that the work is complete. (If there is any work left
-    to be dispatched, this signal will indicate to the control node that more
-    work can be enqueued.)
-
     :param int job_id:
         ID of the currently running job.
-    :param src_ids:
-        List of ids of parsed source models to take into account.
+    :param sources:
+        List of :class:`openquake.hazardlib.source.base.SeismicSource` objects
     :param lt_rlz_id:
         Id of logic tree realization model to calculate for.
+    :param ltp:
+        a :class:`openquake.engine.input.LogicTreeProcessor` instance
     """
     hc = models.HazardCalculation.objects.get(oqjob=job_id)
 
     lt_rlz = models.LtRealization.objects.get(id=lt_rlz_id)
-    ltp = logictree.LogicTreeProcessor(hc.id)
 
     apply_uncertainties = ltp.parse_source_model_logictree_path(
         lt_rlz.sm_lt_path)
     gsims = ltp.parse_gmpe_logictree_path(lt_rlz.gsim_lt_path)
-
-    sources = haz_general.gen_sources(
-        src_ids, apply_uncertainties, hc.rupture_mesh_spacing,
-        hc.width_of_mfd_bin, hc.area_source_discretization)
-
     imts = haz_general.im_dict_to_hazardlib(
         hc.intensity_measure_types_and_levels)
 
@@ -98,12 +69,19 @@ def compute_hazard_curves(job_id, src_ids, lt_rlz_id):
     calc_kwargs = {'gsims': gsims,
                    'truncation_level': hc.truncation_level,
                    'time_span': hc.investigation_time,
-                   'sources': sources,
+                   'sources': map(apply_uncertainties, sources),
                    'imts': imts,
                    'sites': hc.site_collection}
 
     if hc.maximum_distance:
         dist = hc.maximum_distance
+        # NB: a better approach could be to filter the sources by distance
+        # at the beginning and to store into the database only the relevant
+        # sources, as we do in the event based calculator: I am not doing that
+        # for the classical calculator because I wonder about the performance
+        # impact in in SHARE-like calculations. So at the moment we store
+        # everything in the database and we filter on the workers. This
+        # will probably change in the future (MS).
         calc_kwargs['source_site_filter'] = (
             openquake.hazardlib.calc.filters.source_site_distance_filter(dist))
         calc_kwargs['rupture_site_filter'] = (
@@ -113,16 +91,17 @@ def compute_hazard_curves(job_id, src_ids, lt_rlz_id):
     # mapping "imt" to 2d array of hazard curves: first dimension -- sites,
     # second -- IMLs
     with EnginePerformanceMonitor(
-            'computing hazard curves', job_id, hazard_curves, tracing=True):
+            'computing hazard curves', job_id,
+            compute_hazard_curves, tracing=True):
         matrices = openquake.hazardlib.calc.hazard_curve.\
             hazard_curves_poissonian(**calc_kwargs)
 
     with EnginePerformanceMonitor(
-            'saving hazard curves', job_id, hazard_curves, tracing=True):
-        _update_curves(hc, matrices, lt_rlz, src_ids)
+            'saving hazard curves', job_id, compute_hazard_curves):
+        _update_curves(hc, matrices, lt_rlz)
 
 
-def _update_curves(hc, matrices, lt_rlz, src_ids):
+def _update_curves(hc, matrices, lt_rlz):
     """
     Helper function for updating source, hazard curve, and realization progress
     records in the database.
@@ -134,8 +113,6 @@ def _update_curves(hc, matrices, lt_rlz, src_ids):
     :param lt_rlz:
         :class:`openquake.engine.db.models.LtRealization` record for the
         current realization.
-    :param src_ids:
-        List of source IDs considered for this calculation task.
     """
     with logs.tracing('_update_curves for all IMTs'):
         for imt in hc.intensity_measure_types_and_levels.keys():
@@ -165,30 +142,6 @@ def _update_curves(hc, matrices, lt_rlz, src_ids):
 
                     logs.LOG.debug('< done updating hazard for IMT=%s' % imt)
 
-        with transaction.commit_on_success():
-            # Check here if any of records in source progress model
-            # with parsed_source_id from src_ids are marked as complete,
-            # and rollback and abort if there is at least one
-            src_prog = models.SourceProgress.objects.filter(
-                lt_realization=lt_rlz, parsed_source__in=src_ids)
-
-            if any(x.is_complete for x in src_prog):
-                msg = (
-                    'One or more `source_progress` records were marked as '
-                    'complete. This was unexpected and probably means that the'
-                    ' calculation workload was not distributed properly.'
-                )
-                logs.LOG.critical(msg)
-                transaction.rollback()
-                raise RuntimeError(msg)
-
-            # Mark source_progress records as complete
-            src_prog.update(is_complete=True)
-
-            # Update realiation progress,
-            # mark realization as complete if it is done
-            haz_general.update_realization(lt_rlz.id, len(src_ids))
-
 
 class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
     """
@@ -199,7 +152,7 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
     and GMPEs (Ground Motion Prediction Equations) from logic trees.
     """
 
-    core_calc_task = hazard_curves
+    core_calc_task = compute_hazard_curves
 
     def pre_execute(self):
         """
@@ -214,12 +167,12 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
         # Parse vulnerability and exposure model
         self.parse_risk_models()
 
-        # Parse logic trees and create source Inputs.
-        self.initialize_sources()
-
         # Deal with the site model and compute site data for the calculation
         # (if a site model was specified, that is).
         self.initialize_site_model()
+
+        # Parse logic trees and create source Inputs.
+        self.initialize_sources()
 
         # Now bootstrap the logic tree realizations and related data.
         # This defines for us the "work" that needs to be done when we reach
@@ -230,16 +183,6 @@ class ClassicalHazardCalculator(haz_general.BaseHazardCalculator):
         # work is complete.
         self.initialize_realizations(
             rlz_callbacks=[self.initialize_hazard_curve_progress])
-
-        self.record_init_stats()
-
-        # Set the progress counters:
-        num_sources = models.SourceProgress.objects.filter(
-            is_complete=False,
-            lt_realization__hazard_calculation=self.hc).count()
-        self.progress['total'] = num_sources
-
-        self.initialize_pr_data()
 
     def post_execute(self):
         """
@@ -260,10 +203,9 @@ BaseHazardCalculator.finalize_hazard_curves`
         In this case, this includes all of the data for this calculation in the
         tables found in the `htemp` schema space.
         """
+        super(ClassicalHazardCalculator, self).clean_up()
         logs.LOG.debug('> cleaning up temporary DB data')
         models.HazardCurveProgress.objects.filter(
-            lt_realization__hazard_calculation=self.hc.id).delete()
-        models.SourceProgress.objects.filter(
             lt_realization__hazard_calculation=self.hc.id).delete()
         logs.LOG.debug('< done cleaning up temporary DB data')
 

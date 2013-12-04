@@ -29,7 +29,6 @@ import numpy
 import os
 import csv
 import random
-import redis
 import shutil
 import string
 import sys
@@ -69,17 +68,7 @@ patch = functools.partial(mock_module.patch, mocksignature=True)
 
 def default_user():
     """Return the default user to be used for test setups."""
-    return models.OqUser.objects.get(user_name="openquake")
-
-
-def insert_inputs(job, inputs):
-    """Insert the input records for the given data and job."""
-    for imt, imp in inputs:
-        iobj = models.Input(path=imp, input_type=imt, owner=job.owner,
-                            size=random.randint(1024, 16 * 1024))
-        iobj.save()
-        i2j = models.Input2job(input=iobj, oq_job=job)
-        i2j.save()
+    return "openquake"
 
 
 def _patched_mocksignature(func, mock=None, skipfirst=False):
@@ -150,7 +139,7 @@ def run_hazard_job(cfg, exports=None):
     hc = job.hazard_calculation
     calc = get_calculator_class('hazard', hc.calculation_mode)(job)
     try:
-        logs.init_logs_amqp_send(
+        logs.init_logs(
             level='ERROR', calc_domain='hazard', calc_id=hc.id)
         engine._do_run_calc(job, exports, calc, 'hazard')
     finally:
@@ -183,7 +172,7 @@ def run_risk_job(cfg, exports=None, hazard_calculation_id=None,
 
     rc = job.risk_calculation
     calc = get_calculator_class('risk', rc.calculation_mode)(job)
-    logs.init_logs_amqp_send(level='ERROR', calc_domain='risk', calc_id=rc.id)
+    logs.init_logs(level='ERROR', calc_domain='risk', calc_id=rc.id)
     completed_job = engine._do_run_calc(job, exports, calc, 'risk')
     job.is_running = False
     job.save()
@@ -318,110 +307,6 @@ def cleanup_loggers():
     sys.stderr = STDERR
 
 
-class TestStore(object):
-    """Simple key value store, to be used in tests only."""
-
-    _conn = None
-
-    @classmethod
-    def kvs(cls):
-        TestStore.open()
-        return TestStore._conn
-
-    @classmethod
-    def open(cls):
-        """Initialize the test store."""
-        if TestStore._conn is not None:
-            return
-        TestStore._conn = redis.Redis(db=int(config.get("kvs", "test_db")))
-
-    @classmethod
-    def close(cls):
-        """Close the test store."""
-        TestStore._conn.flushdb()
-        TestStore._conn = None
-
-    @classmethod
-    def nextkey(cls):
-        """Generate an unused key
-
-        :return: The test store key generated.
-        :rtype: integer
-        """
-        TestStore.open()
-        return TestStore._conn.incr('the-key', amount=1)
-
-    @classmethod
-    def add(cls, obj):
-        """Add a datum to the store and return the key chosen.
-
-        :param obj: The datum to be added to the store.
-        :returns: The identifier of the datum added.
-        :rtype: integer
-        """
-        TestStore.open()
-        return TestStore.put(TestStore.nextkey(), obj)
-
-    @classmethod
-    def put(cls, key, obj):
-        """Append the datum to the kvs list identified the given `key`.
-
-        :param key: The key for the datum to be added to the store.
-        :param obj: The datum to be added to the store.
-        :returns: The `key` given.
-        """
-        TestStore.open()
-        if isinstance(obj, list) or isinstance(obj, tuple):
-            for elem in obj:
-                TestStore._conn.rpush(key, elem)
-        else:
-            TestStore._conn.rpush(key, obj)
-        return key
-
-    @classmethod
-    def remove(cls, oid):
-        """Remove the datum with given identifier from the store.
-
-        :param oid: The identifier associated with the datum to be removed.
-        """
-        TestStore.open()
-        TestStore._conn.delete(oid)
-
-    @classmethod
-    def lookup(cls, oid):
-        """Return the datum associated with `oid` or `None`.
-
-        :param oid: The identifier of the datum sought.
-        """
-        TestStore.open()
-        num_of_words = TestStore._conn.llen(oid)
-        if num_of_words > 1:
-            return TestStore._conn.lrange(oid, 0, num_of_words + 1)
-        else:
-            return TestStore._conn.lindex(oid, 0)
-
-    @classmethod
-    def set(cls, key, obj):
-        """Asssociate a single datum with the given `key`.
-
-        :param key: The key for the datum to be added to the store.
-        :param obj: The datum to be added to the store.
-        :returns: The `key` given.
-        """
-        TestStore.open()
-        TestStore._conn.set(key, obj)
-
-    @classmethod
-    def get(cls, key):
-        """Return the datum associated with the given `key` or `None`.
-
-        :param key: The key of the datum sought.
-        :returns: The datum associated with the given `key` or `None`.
-        """
-        TestStore.open()
-        return TestStore._conn.get(key)
-
-
 def touch(content=None, dir=None, prefix="tmp", suffix="tmp"):
     """Create temporary file with the given content.
 
@@ -481,19 +366,6 @@ class ConfigTestCase(object):
         os.environ["OQ_SITE_CFG_PATH"] = site_path
         config.Config().cfg.clear()
         config.Config()._load_from_file()
-
-
-class RedisTestCase(object):
-    """Redis-related utilities for testing."""
-
-    def connect(self, *args, **kwargs):
-        host = config.get("kvs", "host")
-        port = config.get("kvs", "port")
-        port = int(port) if port else 6379
-        stats_db = config.get("kvs", "stats_db")
-        stats_db = int(stats_db) if stats_db else 15
-        args = {"host": host, "port": port, "db": stats_db}
-        return redis.Redis(**args)
 
 
 def random_string(length=16):
@@ -596,40 +468,36 @@ def _deep_eq(a, b, decimal, exclude=None):
             assert a == b, "%s != %s" % (a, b)
 
 
-def get_hazard_job(cfg, username=None):
+def get_hazard_job(cfg, username="openquake"):
     """
     Given a path to a config file, create a
     :class:`openquake.engine.db.models.OqJob` object for a hazard calculation.
     """
-    username = username if username is not None else default_user().user_name
-
     return engine.haz_job_from_file(cfg, username, 'error', [])
 
 
-def get_risk_job(cfg, username=None, hazard_calculation_id=None,
+def get_risk_job(cfg, username="openquake", hazard_calculation_id=None,
                  hazard_output_id=None):
     """
     Given a path to a config file and a hazard_calculation_id
     (or, alternatively, a hazard_output_id, create a
     :class:`openquake.engine.db.models.OqJob` object for a risk calculation.
     """
-    username = username if username is not None else default_user().user_name
-
     # You can't specify both a hazard output and hazard calculation
     # Pick one
     assert not (hazard_calculation_id is not None
                 and hazard_output_id is not None)
 
     job = engine.prepare_job(username)
-    params, files = engine.parse_config(open(cfg, 'r'))
+    params = engine.parse_config(open(cfg, 'r'))
 
     params.update(
         dict(hazard_output_id=hazard_output_id,
              hazard_calculation_id=hazard_calculation_id)
     )
 
-    risk_calc = engine.create_risk_calculation(
-        job.owner, params, files)
+    risk_calc = engine.create_calculation(
+        models.RiskCalculation, params)
     risk_calc = models.RiskCalculation.objects.get(id=risk_calc.id)
     job.risk_calculation = risk_calc
     job.save()
@@ -760,7 +628,7 @@ def populate_gmf_data_from_csv(job, fname):
 
 
 def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
-                      username=None):
+                      username="openquake"):
     """
     Takes in input the paths to a risk job config file and a hazard job config
     file.
@@ -772,7 +640,6 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
 
     :param output_type: gmf, gmf_scenario, or curve
     """
-    username = username if username is not None else default_user().user_name
 
     hazard_job = get_hazard_job(hazard_cfg, username)
     hc = hazard_job.hazard_calculation
@@ -824,20 +691,20 @@ def get_fake_risk_job(risk_cfg, hazard_cfg, output_type="curve",
     hazard_job.status = "complete"
     hazard_job.save()
     job = engine.prepare_job(username)
-    params, files = engine.parse_config(open(risk_cfg, 'r'))
+    params = engine.parse_config(open(risk_cfg, 'r'))
 
     params.update(dict(hazard_output_id=hazard_output.output.id))
 
-    risk_calc = engine.create_risk_calculation(job.owner, params, files)
+    risk_calc = engine.create_calculation(models.RiskCalculation, params)
     job.risk_calculation = risk_calc
     job.save()
-    error_message = validate(job, 'risk', params, files, [])
+    error_message = validate(job, 'risk', params, [])
 
     # reload risk calculation to have all the types converted properly
     job.risk_calculation = models.RiskCalculation.objects.get(id=risk_calc.id)
     if error_message:
         raise RuntimeError(error_message)
-    return job, files
+    return job, set(params['inputs'])
 
 
 def get_ruptures(job, ses_collection, num):
@@ -866,6 +733,8 @@ def get_ruptures(job, ses_collection, num):
         models.SESRupture.objects.create(
             ses=ses,
             tag='rlz=%d|ses=%d|src=test|i=%d' % (rlz, ses.ordinal, i),
+            magnitude=1 + i * 10. / float(num),
+            hypocenter=Point(0, 0, 0.1).wkt2d,
             rupture=ProbabilisticRupture(
                 mag=1 + i * 10. / float(num), rake=0,
                 tectonic_region_type="test region type",

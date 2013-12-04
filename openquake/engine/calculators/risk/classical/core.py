@@ -26,9 +26,10 @@ from openquake.engine.performance import EnginePerformanceMonitor
 from openquake.engine.calculators import post_processing
 from openquake.engine.calculators.risk import (
     base, hazard_getters, validation, writers)
+from openquake.engine.utils import tasks
 
 
-@base.risk_task
+@tasks.oqtask
 def classical(job_id, units, containers, params):
     """
     Celery task for the classical risk calculator.
@@ -44,18 +45,17 @@ def classical(job_id, units, containers, params):
       An instance of :class:`..base.CalcParams` used to compute
       derived outputs
     """
-    def profile(name):
-        return EnginePerformanceMonitor(name, job_id, classical, tracing=True)
+    monitor = EnginePerformanceMonitor(None, job_id, classical, tracing=True)
 
     # Do the job in other functions, such that they can be unit tested
     # without the celery machinery
-    with transaction.commit_on_success(using='reslt_writer'):
+    with transaction.commit_on_success(using='job_init'):
         for unit in units:
             do_classical(
                 unit,
                 containers.with_args(loss_type=unit.loss_type),
                 params,
-                profile)
+                monitor.copy)
 
 
 def do_classical(unit, containers, params, profile):

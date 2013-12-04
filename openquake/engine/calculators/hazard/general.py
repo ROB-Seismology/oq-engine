@@ -18,26 +18,26 @@
 
 """Common code for the hazard calculators."""
 
-import math
 import os
 import random
 import re
+import collections
+
+import numpy
 
 import openquake.hazardlib
 import openquake.hazardlib.site
-import numpy
-
-from django.db import transaction, connections
-from django.db.models import Sum
-from shapely import geometry
-
 from openquake.hazardlib import correlation
-from openquake.hazardlib import geo as hazardlib_geo
+
+# FIXME: one must import the engine before django to set DJANGO_SETTINGS_MODULE
+from openquake.engine.db import models
+from django.db import transaction, connections
+
 from openquake.nrmllib import parsers as nrml_parsers
+from openquake.nrmllib.models import PointSource
 from openquake.nrmllib.risk import parsers
 
-from openquake.engine.input import exposure
-from openquake.engine import engine
+from openquake.engine.input import source, exposure
 from openquake.engine import logs
 from openquake.engine import writer
 from openquake.engine.calculators import base
@@ -46,13 +46,10 @@ from openquake.engine.calculators.post_processing import quantile_curve
 from openquake.engine.calculators.post_processing import (
     weighted_quantile_curve
 )
-from openquake.engine.db import models
 from openquake.engine.export import core as export_core
 from openquake.engine.export import hazard as hazard_export
 from openquake.engine.input import logictree
-from openquake.engine.input import source
 from openquake.engine.utils import config
-from openquake.engine.utils import stats
 from openquake.engine.utils.general import block_splitter
 from openquake.engine.performance import EnginePerformanceMonitor
 
@@ -66,14 +63,12 @@ POES_PARAM_NAME = "POES"
 DILATION_ONE_METER = 1e-5
 
 
-def store_site_model(input_mdl, site_model_source):
+def store_site_model(job, site_model_source):
     """Invoke site model parser and save the site-specified parameter data to
     the database.
 
-    :param input_mdl:
-        The `uiapi.input` record which the new `hzrdi.site_model` records
-        reference. This `input` record acts as a container for the site model
-        data.
+    :param job:
+        The job that is loading this site_model_source
     :param site_model_source:
         Filename or file-like object containing the site model XML data.
     :returns:
@@ -86,38 +81,9 @@ def store_site_model(input_mdl, site_model_source):
                              z2pt5=node.z2pt5,
                              kappa=node.kappa,
                              location=node.wkt,
-                             input_id=input_mdl.id)
+                             job_id=job.id)
             for node in parser.parse()]
     return writer.CacheInserter.saveall(data)
-
-
-def gen_sources(src_ids, apply_uncertainties, rupture_mesh_spacing,
-                width_of_mfd_bin, area_source_discretization):
-    """
-    Hazardlib source objects generator for a given set of sources.
-
-    Performs lazy loading, converting and processing of sources.
-
-    :param src_ids:
-        A list of IDs for :class:`openquake.engine.db.models.ParsedSource`
-        records.
-    :param apply_uncertainties:
-        A function to be called on each generated source. See
-        :meth:`openquake.engine.input.logictree.LogicTreeProcessor.\
-parse_source_model_logictree_path`
-
-    For information about the other parameters, see
-    :func:`openquake.engine.input.source.nrml_to_hazardlib`.
-    """
-    for src_id in src_ids:
-        parsed_source = models.ParsedSource.objects.get(id=src_id)
-
-        hazardlib_source = source.nrml_to_hazardlib(
-            parsed_source.nrml, rupture_mesh_spacing, width_of_mfd_bin,
-            area_source_discretization)
-
-        apply_uncertainties(hazardlib_source)
-        yield hazardlib_source
 
 
 def im_dict_to_hazardlib(im_dict):
@@ -158,42 +124,6 @@ def imt_to_hazardlib(imt):
         return imt_class()
 
 
-def update_realization(lt_rlz_id, num_items):
-    """
-    Call this function when a task is complete to update realization counters
-    with the ``num_items`` completed.
-
-    If the `completed_items` becomes equal to the `total_items` for the
-    realization, the realization will be marked as complete.
-
-    .. note::
-        Because this function performs a SELECT FOR UPDATE query, it is
-        expected that this should be called in the context of a transaction, to
-        avoid race conditions.
-
-    :param int lt_rlz_id:
-        ID of the :class:`openquake.engine.db.models.LtRealization` we want
-        to update.
-    :param int num_items:
-        The number of items by which we want to increment the realization's
-        `completed_items` counter.
-    """
-    ltr_query = """
-    SELECT * FROM hzrdr.lt_realization
-    WHERE id = %s
-    FOR UPDATE
-    """
-
-    [lt_rlz] = models.LtRealization.objects.raw(
-        ltr_query, [lt_rlz_id])
-
-    lt_rlz.completed_items += num_items
-    if lt_rlz.completed_items == lt_rlz.total_items:
-        lt_rlz.is_complete = True
-
-    lt_rlz.save()
-
-
 def get_correl_model(hc):
     """
     Helper function for constructing the appropriate correlation model.
@@ -216,62 +146,23 @@ def get_correl_model(hc):
     return correl_model_cls(**hc.ground_motion_correlation_params)
 
 
-def validate_site_model(sm_nodes, mesh):
-    """Given the geometry for a site model and the geometry of interest for the
-    calculation (``mesh``, make sure the geometry of interest lies completely
-    inside of the convex hull formed by the site model locations.
-
-    If a point of interest lies directly on top of a vertex or edge of the site
-    model area (a polygon), it is considered "inside"
-
-    :param sm_nodes:
-        Sequence of :class:`~openquake.engine.db.models.SiteModel` objects.
-    :param mesh:
-        A :class:`openquake.hazardlib.geo.mesh.Mesh` which represents the
-        calculation points of interest.
-
-    :raises:
-        :exc:`RuntimeError` if the area of interest (given as a mesh) is not
-        entirely contained by the site model.
-    """
-    sm_mp = geometry.MultiPoint(
-        [(n.location.x, n.location.y) for n in sm_nodes]
-    )
-
-    sm_ch = sm_mp.convex_hull
-    # Enlarging the area if the site model nodes
-    # create a straight line with zero area.
-    if sm_ch.area == 0:
-        sm_ch = sm_ch.buffer(DILATION_ONE_METER)
-
-    sm_poly = hazardlib_geo.Polygon(
-        [hazardlib_geo.Point(*x) for x in sm_ch.exterior.coords]
-    )
-
-    # "Intersects" is the correct operation (not "contains"), since we're just
-    # checking a collection of points (mesh). "Contains" would tell us if the
-    # points are inside the polygon, but would return `False` if a point was
-    # directly on top of a polygon edge or vertex. We want these points to be
-    # included.
-    intersects = sm_poly.intersects(mesh)
-
-    if not intersects.all():
-        raise RuntimeError(
-            ['Sites of interest are outside of the site model coverage area.'
-             ' This configuration is invalid.']
-        )
-
-
 class BaseHazardCalculator(base.Calculator):
     """
     Abstract base class for hazard calculators. Contains a bunch of common
     functionality, like initialization procedures.
     """
 
-    def __init__(self, *args, **kwargs):
-        super(BaseHazardCalculator, self).__init__(*args, **kwargs)
+    def __init__(self, job):
+        super(BaseHazardCalculator, self).__init__(job)
+        # a dictionary (sm_name, source_type) -> source_ids
+        self.sources_per_model = collections.defaultdict(list)
+        # a dictionary rlz -> source model name (in the logic tree)
+        self.rlz_to_sm = {}
 
-        self.progress.update(in_queue=0)
+    def clean_up(self, *args, **kwargs):
+        """Clean up dictionaries at the end"""
+        self.sources_per_model.clear()
+        self.rlz_to_sm.clear()
 
     @property
     def hc(self):
@@ -302,7 +193,7 @@ class BaseHazardCalculator(base.Calculator):
         """
         return int(config.get('hazard', 'concurrent_tasks'))
 
-    def task_arg_gen(self, block_size, check_num_task=True):
+    def task_arg_gen(self, block_size):
         """
         Loop through realizations and sources to generate a sequence of
         task arg tuples. Each tuple of args applies to a single task.
@@ -321,31 +212,27 @@ class BaseHazardCalculator(base.Calculator):
         realizations = self._get_realizations()
 
         n = 0  # number of yielded arguments
+        ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
+
         for lt_rlz in realizations:
+            sm = self.rlz_to_sm[lt_rlz]
+
             # separate point sources from all the other types, since
             # we distribution point sources in different sized chunks
             # point sources first
-            point_source_ids = self._get_point_source_ids(lt_rlz)
-
-            for block in block_splitter(point_source_ids,
+            point_sources = self.sources_per_model[sm, 'point']
+            for block in block_splitter(point_sources,
                                         point_source_block_size):
-                task_args = (self.job.id, block, lt_rlz.id)
+                task_args = (self.job.id, block, lt_rlz.id, ltp)
                 yield task_args
                 n += 1
+
             # now for area and fault sources
-            other_source_ids = self._get_source_ids(lt_rlz)
-
-            for block in block_splitter(other_source_ids, block_size):
-                task_args = (self.job.id, block, lt_rlz.id)
+            other_sources = self.sources_per_model[sm, 'other']
+            for block in block_splitter(other_sources, block_size):
+                task_args = (self.job.id, block, lt_rlz.id, ltp)
                 yield task_args
                 n += 1
-
-        # this sanity check should go into a unit test, and will likely
-        # go there in the future
-        if check_num_task:
-            num_tasks = models.JobStats.objects.get(
-                oq_job=self.job.id).num_tasks
-            assert num_tasks == n, 'Expected %d tasks, got %d' % (num_tasks, n)
 
     def _get_realizations(self):
         """
@@ -354,40 +241,6 @@ class BaseHazardCalculator(base.Calculator):
         return models.LtRealization.objects\
             .filter(hazard_calculation=self.hc, is_complete=False)\
             .order_by('id')
-
-    @staticmethod
-    def _get_point_source_ids(lt_rlz):
-        """
-        Get `parsed_source` IDs for all of the point sources for a given logic
-        tree realization. See also :meth:`_get_source_ids`.
-
-        :param lt_rlz:
-            A :class:`openquake.engine.db.models.LtRealization` instance.
-        """
-        return models.SourceProgress.objects\
-            .filter(is_complete=False, lt_realization=lt_rlz,
-                    parsed_source__source_type='point')\
-            .order_by('id')\
-            .values_list('parsed_source_id', flat=True)
-
-    @staticmethod
-    def _get_source_ids(lt_rlz):
-        """
-        Get `parsed_source` IDs for all sources for a given logic tree
-        realization, except for point sources. See
-        :meth:`_get_point_source_ids`.
-
-        :param lt_rlz:
-            A :class:`openquake.engine.db.models.LtRealization` instance.
-        """
-        return models.SourceProgress.objects\
-            .filter(is_complete=False, lt_realization=lt_rlz,
-                    parsed_source__source_type__in=['area',
-                                                    'complex',
-                                                    'simple',
-                                                    'characteristic'])\
-            .order_by('id')\
-            .values_list('parsed_source_id', flat=True)
 
     def finalize_hazard_curves(self):
         """
@@ -424,13 +277,11 @@ class BaseHazardCalculator(base.Calculator):
             for imt, imls in im.items():
                 hc_im_type, sa_period, sa_damping = models.parse_imt(imt)
 
-                hco = models.Output(
-                    owner=self.hc.owner,
+                hco = models.Output.objects.create(
                     oq_job=self.job,
-                    display_name="hc-rlz-%s" % rlz.id,
+                    display_name="Hazard Curve rlz-%s" % rlz.id,
                     output_type='hazard_curve',
                 )
-                hco.save()
 
                 haz_curve = models.HazardCurve(
                     output=hco,
@@ -443,8 +294,8 @@ class BaseHazardCalculator(base.Calculator):
                 )
                 haz_curve.save()
 
-                with transaction.commit_on_success(using='reslt_writer'):
-                    cursor = connections['reslt_writer'].cursor()
+                with transaction.commit_on_success(using='job_init'):
+                    cursor = connections['job_init'].cursor()
 
                     # TODO(LB): I don't like the fact that we have to pass
                     # potentially huge arguments (100k sites, for example).
@@ -467,44 +318,31 @@ class BaseHazardCalculator(base.Calculator):
                         [self.hc.id, rlz.id, haz_curve.id, imt, lons, lats]
                     )
 
+    def filtered_sites(self, src):
+        """
+        Do not filter sites up front: overridden in the event based subclass
+        """
+        return self.hc.site_collection
+
     @EnginePerformanceMonitor.monitor
     def initialize_sources(self):
         """
-        Parse and validation logic trees (source and gsim). Then get all
-        sources referenced in the the source model logic tree, create
-        :class:`~openquake.engine.db.models.Input` records for all of them,
-        parse then, and save the parsed sources to the `parsed_source` table
-        (see :class:`openquake.engine.db.models.ParsedSource`).
+        Parse and validate source logic trees
         """
         logs.LOG.progress("initializing sources")
-
-        [smlt] = models.inputs4hcalc(
-            self.hc.id, input_type='source_model_logic_tree')
-        [gsimlt] = models.inputs4hcalc(
-            self.hc.id, input_type='gsim_logic_tree')
-
-        source_paths = logictree.read_logic_trees_from_db(self.hc.id)
-
-        for src_path in source_paths:
-            full_path = os.path.join(self.hc.base_path, src_path)
-
-            # Get the 'source' Input:
-            inp = engine.get_or_create_input(
-                full_path, 'source', self.hc.owner, haz_calc_id=self.hc.id
-            )
-
-            models.Src2ltsrc.objects.create(hzrd_src=inp, lt_src=smlt,
-                                            filename=src_path)
-            src_content = inp.model_content.as_string_io
-            sm_parser = nrml_parsers.SourceModelParser(src_content)
-
-            # Covert
-            src_db_writer = source.SourceDBWriter(
-                inp, sm_parser.parse(), self.hc.rupture_mesh_spacing,
-                self.hc.width_of_mfd_bin,
-                self.hc.area_source_discretization
-            )
-            src_db_writer.serialize()
+        for src_path in logictree.read_logic_trees(self.hc):
+            for src_nrml in nrml_parsers.SourceModelParser(
+                    os.path.join(self.hc.base_path, src_path)).parse():
+                src = source.nrml_to_hazardlib(
+                    src_nrml,
+                    self.hc.rupture_mesh_spacing,
+                    self.hc.width_of_mfd_bin,
+                    self.hc.area_source_discretization)
+                if self.filtered_sites(src):
+                    if isinstance(src_nrml, PointSource):
+                        self.sources_per_model[src_path, 'point'].append(src)
+                    else:
+                        self.sources_per_model[src_path, 'other'].append(src)
 
     @EnginePerformanceMonitor.monitor
     def parse_risk_models(self):
@@ -516,22 +354,16 @@ class BaseHazardCalculator(base.Calculator):
         vulnerability model (if there is one)
         """
         hc = self.hc
-        queryset = self.hc.inputs.filter(
-            input_type__in=[vf_type
-                            for vf_type, _desc
-                            in models.Input.VULNERABILITY_TYPE_CHOICES])
-        if queryset.exists():
+        if hc.vulnerability_models:
             logs.LOG.progress("parsing risk models")
 
             hc.intensity_measure_types_and_levels = dict()
             hc.intensity_measure_types = list()
 
-            for input_type in queryset:
-                content = input_type.model_content.as_string_io
+            for vf in hc.vulnerability_models:
                 intensity_measure_types_and_levels = dict(
                     (record['IMT'], record['IML']) for record in
-                    parsers.VulnerabilityModelParser(content)
-                )
+                    parsers.VulnerabilityModelParser(vf))
 
                 for imt, levels in \
                         intensity_measure_types_and_levels.items():
@@ -557,16 +389,12 @@ class BaseHazardCalculator(base.Calculator):
                               hc.intensity_measure_types_and_levels,
                               hc.intensity_measure_types))
 
-        queryset = self.hc.inputs.filter(input_type='fragility')
-        if queryset.exists():
+        if 'fragility' in hc.inputs:
             hc.intensity_measure_types_and_levels = dict()
             hc.intensity_measure_types = list()
 
-            parser = iter(
-                parsers.FragilityModelParser(
-                    queryset.all()[0].model_content.as_string_io
-                )
-            )
+            parser = iter(parsers.FragilityModelParser(
+                hc.inputs['fragility']))
             hc = self.hc
 
             fragility_format, _limit_states = parser.next()
@@ -583,60 +411,40 @@ class BaseHazardCalculator(base.Calculator):
             hc.intensity_measure_types.extend(
                 hc.intensity_measure_types_and_levels)
             hc.save()
-        queryset = self.hc.inputs.filter(input_type='exposure')
-        if queryset.exists():
-            exposure_model_input = queryset.all()[0]
-            content = exposure_model_input.model_content.as_string_io
+
+        if 'exposure' in hc.inputs:
             with logs.tracing('storing exposure'):
                 exposure.ExposureDBWriter(
-                    exposure_model_input).serialize(
-                        parsers.ExposureModelParser(content))
+                    self.job).serialize(
+                    parsers.ExposureModelParser(hc.inputs['exposure']))
 
     @EnginePerformanceMonitor.monitor
     def initialize_site_model(self):
         """
-        If a site model is specified in the calculation configuration, parse
-        it and load it into the `hzrdi.site_model` table. This includes a
-        validation step to ensure that the area covered by the site model
-        completely envelops the calculation geometry. (If this requirement is
-        not satisfied, an exception will be raised. See
-        :func:`openquake.engine.calculators.hazard.general.validate_site_model`.)
+        Populate the hazard site table.
+
+        If a site model is specified in the calculation configuration,
+        parse it and load it into the `hzrdi.site_model` table.
         """
-        logs.LOG.progress("initializing site model")
-        site_model_inp = models.get_site_model(self.hc.id)
+        logs.LOG.progress("initializing sites")
+        self.hc.points_to_compute(save_sites=True)
+
+        site_model_inp = self.hc.site_model
         if site_model_inp:
-            # Store `site_model` records:
-            store_site_model(
-                site_model_inp, site_model_inp.model_content.as_string_io
-            )
-
-            # Get the site model records we stored:
-            site_model_data = models.SiteModel.objects.filter(
-                input=site_model_inp)
-
-            validate_site_model(
-                site_model_data, self.hc.points_to_compute(save_sites=True)
-            )
-        else:
-            self.hc.points_to_compute(save_sites=True)
+            store_site_model(self.job, site_model_inp)
 
     # Silencing 'Too many local variables'
     # pylint: disable=R0914
-    @transaction.commit_on_success(using='reslt_writer')
+    @transaction.commit_on_success(using='job_init')
     def initialize_realizations(self, rlz_callbacks=None):
         """
-        Create records for the `hzrdr.lt_realization` and
-        `htemp.source_progress` records.
+        Create records for the `hzrdr.lt_realization`.
 
         This function works either in random sampling mode (when lt_realization
         models get the random seed value) or in enumeration mode (when weight
         values are populated). In both cases we record the logic tree paths
         for both trees in the `lt_realization` record, as well as ordinal
         number of the realization (zero-based).
-
-        Then we create `htemp.source_progress` records for each source
-        in the source model chosen for each realization,
-        see :meth:`initialize_source_progress`.
 
         :param rlz_callbacks:
             Optionally, you can specify a list of callbacks for each
@@ -657,20 +465,6 @@ class BaseHazardCalculator(base.Calculator):
             self._initialize_realizations_enumeration(
                 rlz_callbacks=rlz_callbacks)
 
-    def initialize_pr_data(self):
-        """Record the total/completed number of work items.
-
-        This is needed for the purpose of providing an indication of progress
-        to the end user."""
-        stats.pk_set(self.job.id, "lvr", 0)
-        rs = models.LtRealization.objects.filter(
-            hazard_calculation=self.job.hazard_calculation)
-        total = rs.aggregate(Sum("total_items"))
-        done = rs.aggregate(Sum("completed_items"))
-        stats.pk_set(self.job.id, "nhzrd_total", total.values().pop())
-        if done > 0:
-            stats.pk_set(self.job.id, "nhzrd_done", done.values().pop())
-
     def _initialize_realizations_enumeration(self, rlz_callbacks=None):
         """
         Perform full paths enumeration of logic trees and populate
@@ -680,36 +474,23 @@ class BaseHazardCalculator(base.Calculator):
             See :meth:`initialize_realizations` for more info.
         """
         hc = self.job.hazard_calculation
-        [smlt] = models.inputs4hcalc(hc.id,
-                                     input_type='source_model_logic_tree')
-        ltp = logictree.LogicTreeProcessor(hc.id)
-        hzrd_src_cache = {}
+        ltp = logictree.LogicTreeProcessor.from_hc(hc)
+        self.rlz_to_sm = {}
 
         for i, path_info in enumerate(ltp.enumerate_paths()):
-            sm_name, weight, sm_lt_path, gsim_lt_path = path_info
+            source_model_filename, weight, sm_lt_path, gsim_lt_path = path_info
 
-            lt_rlz = models.LtRealization(
+            lt_rlz = models.LtRealization.objects.create(
                 hazard_calculation=hc,
                 ordinal=i,
                 seed=None,
                 weight=weight,
                 sm_lt_path=sm_lt_path,
                 gsim_lt_path=gsim_lt_path,
-                # we will update total_items in initialize_source_progress()
+                # total_items is obsolete and will be removed
                 total_items=-1)
-            lt_rlz.save()
 
-            if not sm_name in hzrd_src_cache:
-                # Get the source model for this sample:
-                hzrd_src = models.Src2ltsrc.objects.get(
-                    lt_src=smlt.id, filename=sm_name).hzrd_src
-                # and cache it
-                hzrd_src_cache[sm_name] = hzrd_src
-            else:
-                hzrd_src = hzrd_src_cache[sm_name]
-
-            # Create source_progress objects
-            self.initialize_source_progress(lt_rlz, hzrd_src)
+            self.rlz_to_sm[lt_rlz] = source_model_filename
 
             # Run realization callback (if any) to do additional initialization
             # for each realization:
@@ -731,46 +512,32 @@ class BaseHazardCalculator(base.Calculator):
         seed = self.hc.random_seed
         rnd.seed(seed)
 
-        [smlt] = models.inputs4hcalc(self.hc.id,
-                                     input_type='source_model_logic_tree')
-
-        ltp = logictree.LogicTreeProcessor(self.hc.id)
-
-        hzrd_src_cache = {}
+        ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
+        self.rlz_to_sm = {}
 
         # The first realization gets the seed we specified in the config file.
         for i in xrange(self.hc.number_of_logic_tree_samples):
             # Sample source model logic tree branch paths:
-            sm_name, sm_lt_path = ltp.sample_source_model_logictree(
-                rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32))
+            source_model_filename, sm_lt_path = (
+                ltp.sample_source_model_logictree(
+                    rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32)))
 
             # Sample GSIM logic tree branch paths:
             gsim_lt_path = ltp.sample_gmpe_logictree(
                 rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32))
 
-            lt_rlz = models.LtRealization(
+            lt_rlz = models.LtRealization.objects.create(
                 hazard_calculation=self.hc,
                 ordinal=i,
                 seed=seed,
                 weight=None,
                 sm_lt_path=sm_lt_path,
                 gsim_lt_path=gsim_lt_path,
-                # we will update total_items in initialize_source_progress()
+                # total_items is obsolete and will be removed
                 total_items=-1
             )
-            lt_rlz.save()
 
-            if not sm_name in hzrd_src_cache:
-                # Get the source model for this sample:
-                hzrd_src = models.Src2ltsrc.objects.get(
-                    lt_src=smlt.id, filename=sm_name).hzrd_src
-                # and cache it
-                hzrd_src_cache[sm_name] = hzrd_src
-            else:
-                hzrd_src = hzrd_src_cache[sm_name]
-
-            # Create source_progress objects
-            self.initialize_source_progress(lt_rlz, hzrd_src)
+            self.rlz_to_sm[lt_rlz] = source_model_filename
 
             # Run realization callback (if any) to do additional initialization
             # for each realization:
@@ -781,37 +548,6 @@ class BaseHazardCalculator(base.Calculator):
             # update the seed for the next realization
             seed = rnd.randint(models.MIN_SINT_32, models.MAX_SINT_32)
             rnd.seed(seed)
-
-    @staticmethod
-    def initialize_source_progress(lt_rlz, hzrd_src):
-        """
-        Create ``source_progress`` models for given logic tree realization
-        and set total sources of realization.
-
-        :param lt_rlz:
-            :class:`openquake.engine.db.models.LtRealization` object to
-            initialize source progress for.
-        :param hztd_src:
-            :class:`openquake.engine.db.models.Input` object that needed parsed
-            sources are referencing.
-        """
-        cursor = connections['reslt_writer'].cursor()
-        src_progress_tbl = models.SourceProgress._meta.db_table
-        parsed_src_tbl = models.ParsedSource._meta.db_table
-        lt_rlz_tbl = models.LtRealization._meta.db_table
-        cursor.execute("""
-            INSERT INTO "%s" (lt_realization_id, parsed_source_id, is_complete)
-            SELECT %%s, id, FALSE
-            FROM "%s" WHERE input_id = %%s
-            ORDER BY id
-            """ % (src_progress_tbl, parsed_src_tbl),
-            [lt_rlz.id, hzrd_src.id])
-        cursor.execute("""
-            UPDATE "%s" SET total_items = (
-                SELECT count(1) FROM "%s" WHERE lt_realization_id = %%s
-            )""" % (lt_rlz_tbl, src_progress_tbl),
-            [lt_rlz.id])
-        transaction.commit_unless_managed()
 
     def initialize_hazard_curve_progress(self, lt_rlz):
         """
@@ -864,64 +600,6 @@ class BaseHazardCalculator(base.Calculator):
         """
         return hazard_export.export(output_id, export_dir, export_type)
 
-    def record_init_stats(self):
-        """
-        Record some basic job stats, including the number of sites,
-        realizations (end branches), and total number of tasks for the job.
-
-        This should be run between the `pre-execute` and `execute` phases, once
-        the job has been fully initialized.
-        """
-        # Record num sites, num realizations, and num tasks.
-        num_sites = len(self.hc.points_to_compute())
-        realizations = models.LtRealization.objects.filter(
-            hazard_calculation=self.hc.id)
-        num_rlzs = realizations.count()
-
-        [job_stats] = models.JobStats.objects.filter(oq_job=self.job.id)
-        job_stats.num_sites = num_sites
-        job_stats.num_tasks = self.calc_num_tasks()
-        job_stats.num_realizations = num_rlzs
-        job_stats.save()
-
-    def calc_num_tasks(self):
-        """
-        The number of tasks is inferred from the number of sources
-        per realization by using the formula::
-
-                     N * n   N * n0
-         num_tasks = ----- + ------
-                       b       b0
-
-        where:
-
-          N is the number of realizations
-          n is the number of complex source
-          n0 is the number of point sources
-          b is the the block_size
-          b0 is the the point_source_block_size
-
-        The divisions are intended rounded to the closest upper integer
-        (ceil).
-        """
-        num_tasks = 0
-        block_size = self.block_size()
-        point_source_block_size = self.point_source_block_size()
-        total_sources = 0
-        for lt_rlz in self._get_realizations():
-            n = len(self._get_source_ids(lt_rlz))
-            n0 = len(self._get_point_source_ids(lt_rlz))
-            logs.LOG.debug('complex sources: %s, point sources: %d', n, n0)
-            total_sources += n + n0
-            ntasks = math.ceil(float(n) / block_size)
-            ntasks0 = math.ceil(float(n0) / point_source_block_size)
-            logs.LOG.debug(
-                'complex sources tasks: %s, point sources tasks: %d',
-                ntasks, ntasks0)
-            num_tasks += ntasks + ntasks0
-        logs.LOG.info('Total number of sources: %d', total_sources)
-        return int(num_tasks)
-
     @EnginePerformanceMonitor.monitor
     def do_aggregate_post_proc(self):
         """
@@ -973,7 +651,7 @@ class BaseHazardCalculator(base.Calculator):
             if self.hc.mean_hazard_curves:
                 mean_output = models.Output.objects.create_output(
                     job=self.job,
-                    display_name='mean-curves-%s' % imt,
+                    display_name='Mean Hazard Curves %s' % imt,
                     output_type='hazard_curve'
                 )
                 mean_hc = models.HazardCurve.objects.create(
@@ -992,7 +670,7 @@ class BaseHazardCalculator(base.Calculator):
                     q_output = models.Output.objects.create_output(
                         job=self.job,
                         display_name=(
-                            'quantile(%s)-curves-%s' % (quantile, imt)
+                            '%s quantile Hazard Curves %s' % (quantile, imt)
                         ),
                         output_type='hazard_curve'
                     )
@@ -1012,7 +690,7 @@ class BaseHazardCalculator(base.Calculator):
                 models.HazardCurveData.objects.all_curves_for_imt(
                     self.job.id, im_type, sa_period, sa_damping))
 
-            with transaction.commit_on_success(using='reslt_writer'):
+            with transaction.commit_on_success(using='job_init'):
                 inserter = writer.CacheInserter(
                     models.HazardCurveData, CURVE_CACHE_SIZE)
 
