@@ -36,13 +36,13 @@ import random
 import itertools
 import collections
 
-import openquake.hazardlib.imt
 import numpy.random
 
 from django.db import transaction
 from openquake.hazardlib.calc import filters
 from openquake.hazardlib.calc import gmf
 from openquake.hazardlib.calc import stochastic
+from openquake.hazardlib.imt import from_string
 
 from openquake.engine import writer, logs
 from openquake.engine.utils.general import block_splitter
@@ -148,7 +148,7 @@ def compute_gmf(job_id, params, imt, gsims, ses, site_coll,
     """
     Compute and save the GMFs for all the ruptures in a SES.
     """
-    imt = haz_general.imt_to_hazardlib(imt)
+    imt = from_string(imt)
     with EnginePerformanceMonitor(
             'reading ruptures', job_id, compute_gmf):
         ruptures = list(models.SESRupture.objects.filter(pk__in=rupture_ids))
@@ -232,14 +232,7 @@ def _save_gmfs(ses, imt, gmvs_per_site, ruptures_per_site, sites):
     """
     gmf_coll = models.Gmf.objects.get(
         lt_realization=ses.ses_collection.lt_realization)
-
-    sa_period = None
-    sa_damping = None
-    if isinstance(imt, openquake.hazardlib.imt.SA):
-        sa_period = imt.period
-        sa_damping = imt.damping
-    imt_name = imt.__class__.__name__
-
+    imt_name, sa_period, sa_damping = imt
     for site_id in gmvs_per_site:
         inserter.add(models.GmfData(
             gmf=gmf_coll,
@@ -354,7 +347,9 @@ class EventBasedHazardCalculator(haz_general.BaseHazardCalculator):
         Optionally compute_gmf in parallel.
         """
         if self.hc.ground_motion_fields:
-            self.parallelize(compute_gmf, self.compute_gmf_arg_gen())
+            self.parallelize(compute_gmf,
+                             self.compute_gmf_arg_gen(),
+                             self.log_percent)
 
     def initialize_ses_db_records(self, lt_rlz):
         """
@@ -431,7 +426,8 @@ class EventBasedHazardCalculator(haz_general.BaseHazardCalculator):
                                           self.job.id):
                 self.parallelize(
                     post_processing.gmf_to_hazard_curve_task,
-                    post_processing.gmf_to_hazard_curve_arg_gen(self.job))
+                    post_processing.gmf_to_hazard_curve_arg_gen(self.job),
+                    self.log_percent)
 
             # If `mean_hazard_curves` is True and/or `quantile_hazard_curves`
             # has some value (not an empty list), do this additional
@@ -447,4 +443,5 @@ class EventBasedHazardCalculator(haz_general.BaseHazardCalculator):
                     self.parallelize(
                         cls_post_proc.hazard_curves_to_hazard_map_task,
                         cls_post_proc.hazard_curves_to_hazard_map_task_arg_gen(
-                            self.job))
+                            self.job),
+                        self.log_percent)

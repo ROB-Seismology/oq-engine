@@ -20,14 +20,13 @@
 
 import os
 import random
-import re
 import collections
 
 import numpy
 
-import openquake.hazardlib
-import openquake.hazardlib.site
 from openquake.hazardlib import correlation
+from openquake.hazardlib.imt import from_string
+
 
 # FIXME: one must import the engine before django to set DJANGO_SETTINGS_MODULE
 from openquake.engine.db import models
@@ -99,29 +98,7 @@ def im_dict_to_hazardlib(im_dict):
     # TODO: file a bug about  SA periods in hazardlib imts.
     # Why are values of 0.0 not allowed? Technically SA(0.0) means PGA, but
     # there must be a reason why we can't do this.
-    hazardlib_im = {}
-
-    for imt, imls in im_dict.items():
-        hazardlib_imt = imt_to_hazardlib(imt)
-        hazardlib_im[hazardlib_imt] = imls
-
-    return hazardlib_im
-
-
-def imt_to_hazardlib(imt):
-    """Covert an IMT string to an hazardlib object.
-
-    :param str imt:
-        Given the IMT string (defined in the job config file), convert it to
-        equivlent hazardlib object. See :mod:`openquake.hazardlib.imt`.
-    """
-    if 'SA' in imt:
-        match = re.match(r'^SA\(([^)]+?)\)$', imt)
-        period = float(match.group(1))
-        return openquake.hazardlib.imt.SA(period, models.DEFAULT_SA_DAMPING)
-    else:
-        imt_class = getattr(openquake.hazardlib.imt, imt)
-        return imt_class()
+    return dict((from_string(imt), imls) for imt, imls in im_dict.items())
 
 
 def get_correl_model(hc):
@@ -211,7 +188,6 @@ class BaseHazardCalculator(base.Calculator):
 
         realizations = self._get_realizations()
 
-        n = 0  # number of yielded arguments
         ltp = logictree.LogicTreeProcessor.from_hc(self.hc)
 
         for lt_rlz in realizations:
@@ -223,16 +199,12 @@ class BaseHazardCalculator(base.Calculator):
             point_sources = self.sources_per_model[sm, 'point']
             for block in block_splitter(point_sources,
                                         point_source_block_size):
-                task_args = (self.job.id, block, lt_rlz.id, ltp)
-                yield task_args
-                n += 1
+                yield self.job.id, block, lt_rlz, ltp
 
             # now for area and fault sources
             other_sources = self.sources_per_model[sm, 'other']
             for block in block_splitter(other_sources, block_size):
-                task_args = (self.job.id, block, lt_rlz.id, ltp)
-                yield task_args
-                n += 1
+                yield self.job.id, block, lt_rlz, ltp
 
     def _get_realizations(self):
         """
@@ -241,82 +213,6 @@ class BaseHazardCalculator(base.Calculator):
         return models.LtRealization.objects\
             .filter(hazard_calculation=self.hc, is_complete=False)\
             .order_by('id')
-
-    def finalize_hazard_curves(self):
-        """
-        Create the final output records for hazard curves. This is done by
-        copying the temporary results from `htemp.hazard_curve_progress` to
-        `hzrdr.hazard_curve` (for metadata) and `hzrdr.hazard_curve_data` (for
-        the actual curve PoE values). Foreign keys are made from
-        `hzrdr.hazard_curve` to `hzrdr.lt_realization` (realization information
-        is need to export the full hazard curve results).
-        """
-        im = self.hc.intensity_measure_types_and_levels
-        points = self.hc.points_to_compute()
-
-        # prepare site locations for the stored function call
-        lons = '{%s}' % ', '.join(str(v) for v in points.lons)
-        lats = '{%s}' % ', '.join(str(v) for v in points.lats)
-
-        realizations = models.LtRealization.objects.filter(
-            hazard_calculation=self.hc.id)
-
-        for rlz in realizations:
-            # create a new `HazardCurve` 'container' record for each
-            # realization (virtual container for multiple imts)
-            models.HazardCurve.objects.create(
-                output=models.Output.objects.create_output(
-                    self.job, "hc-multi-imt-rlz-%s" % rlz.id,
-                    "hazard_curve_multi"),
-                lt_realization=rlz,
-                imt=None,
-                investigation_time=self.hc.investigation_time)
-
-            # create a new `HazardCurve` 'container' record for each
-            # realization for each intensity measure type
-            for imt, imls in im.items():
-                hc_im_type, sa_period, sa_damping = models.parse_imt(imt)
-
-                hco = models.Output.objects.create(
-                    oq_job=self.job,
-                    display_name="Hazard Curve rlz-%s" % rlz.id,
-                    output_type='hazard_curve',
-                )
-
-                haz_curve = models.HazardCurve(
-                    output=hco,
-                    lt_realization=rlz,
-                    investigation_time=self.hc.investigation_time,
-                    imt=hc_im_type,
-                    imls=imls,
-                    sa_period=sa_period,
-                    sa_damping=sa_damping,
-                )
-                haz_curve.save()
-
-                with transaction.commit_on_success(using='job_init'):
-                    cursor = connections['job_init'].cursor()
-
-                    # TODO(LB): I don't like the fact that we have to pass
-                    # potentially huge arguments (100k sites, for example).
-                    # I would like to be able to fetch this site data from
-                    # the stored function, but at the moment, the only form
-                    # available is a pickled `SiteCollection` object, and I've
-                    # experienced problems trying to import third-party libs
-                    # in a DB function context and could not get it to reliably
-                    # work.
-                    # As a fix, in addition to caching the pickled
-                    # SiteCollection in the DB, we could store also arrays for
-                    # lons and lats. It's duplicated information, but we have a
-                    # relatively low number of HazardCalculation records, so it
-                    # shouldn't be a big deal.
-                    cursor.execute(
-                        """
-                        SELECT hzrdr.finalize_hazard_curves(
-                            %s, %s, %s, %s, %s, %s)
-                        """,
-                        [self.hc.id, rlz.id, haz_curve.id, imt, lons, lats]
-                    )
 
     def filtered_sites(self, src):
         """
@@ -644,7 +540,7 @@ class BaseHazardCalculator(base.Calculator):
                     investigation_time=self.hc.investigation_time)
 
         for imt, imls in self.hc.intensity_measure_types_and_levels.items():
-            im_type, sa_period, sa_damping = models.parse_imt(imt)
+            im_type, sa_period, sa_damping = from_string(imt)
 
             # prepare `output` and `hazard_curve` containers in the DB:
             container_ids = dict()
