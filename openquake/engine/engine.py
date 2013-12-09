@@ -18,12 +18,16 @@ calculations."""
 
 import ConfigParser
 import csv
-import zlib
 import getpass
-import md5
 import os
 import sys
+import time
+import logging
 import warnings
+from contextlib import contextmanager
+from datetime import datetime
+
+import celery.task.control
 
 import openquake.engine
 
@@ -31,22 +35,202 @@ from django.core import exceptions
 from django import db as django_db
 from lxml import etree
 
-from openquake.engine import kvs
 from openquake.engine import logs
 from openquake.engine.db import models
 from openquake.engine.job.validation import validate
-from openquake.engine.supervising import supervisor
-from openquake.engine.utils import monitor, get_calculator_class
+from openquake.engine.utils import (
+    config, monitor, get_calculator_class, general)
 from openquake.engine.writer import CacheInserter
+from openquake.engine.settings import DATABASES
+from openquake.engine.db.models import JobStats
+from openquake.engine.db.models import OqJob
+from openquake.engine.db.models import Performance
 
 from openquake import hazardlib
 from openquake import risklib
 from openquake import nrmllib
 
 
-INPUT_TYPES = dict(models.Input.INPUT_TYPE_CHOICES)
+INPUT_TYPES = dict(models.INPUT_TYPE_CHOICES)
+
 UNABLE_TO_DEL_HC_FMT = 'Unable to delete hazard calculation: %s'
 UNABLE_TO_DEL_RC_FMT = 'Unable to delete risk calculation: %s'
+
+LOG_FORMAT = ('[%(asctime)s %(calc_domain)s #%(calc_id)s %(hostname)s '
+              '%(levelname)s %(processName)s/%(process)s %(name)s] '
+              '%(message)s')
+
+TERMINATE = general.str2bool(
+    config.get('celery', 'terminate_workers_on_revoke'))
+
+
+def record_job_stop_time(job):
+    """
+    Call this when a job concludes (successful or not) to record the
+    'stop_time' (using the current UTC time) in the uiapi.job_stats table.
+
+    :param job: the job object
+    """
+    job_stats = JobStats.objects.get(oq_job=job)
+    job_stats.stop_time = datetime.utcnow()
+    job_stats.save(using='job_init')
+
+
+def cleanup_after_job(job, terminate):
+    """
+    Release the resources used by an openquake job.
+
+    :param int job_id: the job id
+    :param bool terminate: the celery revoke command terminate flag
+    """
+    # Using the celery API, terminate and revoke and terminate any running
+    # tasks associated with the current job.
+    task_ids = _get_task_ids(job.id)
+    if task_ids:
+        logs.LOG.warn('Revoking %d tasks', len(task_ids))
+    else:  # this is normal when OQ_NO_DISTRIBUTE=1
+        logs.LOG.debug('No task to revoke')
+    for tid in task_ids:
+        celery.task.control.revoke(tid, terminate=terminate)
+        logs.LOG.debug('Revoked task %s', tid)
+
+
+def _get_task_ids(job_id):
+    """
+    Get all Celery task IDs for a given ``job_id``.
+    """
+    return Performance.objects.filter(
+        oq_job=job_id, operation='storing task id', task_id__isnull=False)\
+        .values_list('task_id', flat=True)
+
+
+def get_job_status(job_id):
+    """
+    Return the status of the job stored in its database record.
+
+    :param job_id: the id of the job
+    :type job_id: int
+    :return: the status of the job
+    :rtype: string
+    """
+
+    return OqJob.objects.get(id=job_id).status
+
+
+def update_job_status(job_id):
+    """
+    Store in the database the status of a job.
+
+    :param int job_id: the id of the job
+    """
+    job = OqJob.objects.get(id=job_id)
+    job.is_running = False
+    job.save()
+
+
+def _update_log_record(self, record):
+    """
+    Massage a log record before emitting it. Intended to be used by the
+    custom log handlers defined in this module.
+    """
+    if not hasattr(record, 'hostname'):
+        record.hostname = '-'
+    if not hasattr(record, 'calc_domain'):
+        record.calc_domain = self.calc_domain
+    if not hasattr(record, 'calc_id'):
+        record.calc_id = self.calc_id
+    logger_name_prefix = 'oq.%s.%s' % (record.calc_domain, record.calc_id)
+    if record.name.startswith(logger_name_prefix):
+        record.name = record.name[len(logger_name_prefix):].lstrip('.')
+        if not record.name:
+            record.name = 'root'
+
+
+class LogStreamHandler(logging.StreamHandler):
+    """
+    Log stream handler
+    """
+    def __init__(self, calc_domain, calc_id):
+        super(LogStreamHandler, self).__init__()
+        self.setFormatter(logging.Formatter(LOG_FORMAT))
+        self.calc_domain = calc_domain
+        self.calc_id = calc_id
+
+    def emit(self, record):  # pylint: disable=E0202
+        _update_log_record(self, record)
+        super(LogStreamHandler, self).emit(record)
+
+
+class LogFileHandler(logging.FileHandler):
+    """
+    Log file handler
+    """
+    def __init__(self, calc_domain, calc_id, log_file):
+        super(LogFileHandler, self).__init__(log_file)
+        self.setFormatter(logging.Formatter(LOG_FORMAT))
+        self.calc_domain = calc_domain
+        self.calc_id = calc_id
+        self.log_file = log_file
+
+    def emit(self, record):  # pylint: disable=E0202
+        _update_log_record(self, record)
+        super(LogFileHandler, self).emit(record)
+
+
+def start_logging(calc_id, calc_domain, log_file):
+    """
+    Add logging handlers to begin collecting log messages.
+
+    :param int calc_id:
+        Hazard or Risk calculation ID.
+    :param str calc_domain:
+        'hazard' or 'risk'
+    :param str log_file:
+        Log file path location. Can be `None`. If a path is specified, we will
+        create a file handler for logging. Else, we just log to the console.
+    """
+    if log_file is not None:
+        logging.root.addHandler(
+            LogFileHandler(calc_domain, calc_id, log_file))
+    else:
+        logging.root.addHandler(
+            LogStreamHandler(calc_domain, calc_id))
+
+
+def save_job_stats(job, disk_space=None):
+    """
+    Save the job_stats for the given job. Should be called only after
+    the site_collection has been initialized.
+    """
+    js = models.JobStats.objects.get(oq_job=job)
+    js.disk_space = disk_space
+
+    if job.risk_calculation:
+        hc = job.risk_calculation.hazard_calculation
+    else:
+        hc = job.hazard_calculation
+    if hc:  # can be None if the option --hazard-output-id is used
+        js.num_sites = len(hc.site_collection) if hc.site_collection else None
+    js.save()
+
+
+@contextmanager
+def job_stats(job):
+    """
+    A context manager saving information such as the number of sites
+    and the disk space occupation in the job_stats table. The information
+    is saved at the end of the job, even if the job fails.
+    """
+    dbname = DATABASES['default']['NAME']
+    curs = models.getcursor('job_init')
+    curs.execute("select pg_database_size(%s)", (dbname,))
+    dbsize = curs.fetchall()[0][0]
+    try:
+        yield
+    finally:
+        curs.execute("select pg_database_size(%s)", (dbname,))
+        new_dbsize = curs.fetchall()[0][0]
+        save_job_stats(job, new_dbsize - dbsize)
 
 
 def prepare_job(user_name="openquake", log_level='progress'):
@@ -63,47 +247,14 @@ def prepare_job(user_name="openquake", log_level='progress'):
     :returns:
         :class:`openquake.engine.db.models.OqJob` instance.
     """
-    # See if the current user exists
-    # If not, create a record for them
-    owner = prepare_user(user_name)
-    job = models.OqJob(
-        owner=owner,
+    return models.OqJob.objects.create(
+        user_name=user_name,
         log_level=log_level,
         oq_version=openquake.engine.__version__,
         nrml_version=nrmllib.__version__,
         hazardlib_version=hazardlib.__version__,
         risklib_version=risklib.__version__,
     )
-    job.save()
-    return job
-
-
-def prepare_user(user_name):
-    """
-    Make sure user with the given name exists, return it.
-    """
-    # See if the current user exists
-    # If not, create a record for them
-    try:
-        user = models.OqUser.objects.get(user_name=user_name)
-    except exceptions.ObjectDoesNotExist:
-        # This user doesn't exist; let's fix that.
-        # NOTE: The Organization is currently hardcoded to 1.
-        # This org is added when the database is bootstrapped.
-        user = models.OqUser(
-            user_name=user_name, full_name=user_name, organization_id=1
-        )
-        user.save()
-    return user
-
-
-def get_current_user():
-    """
-    Utilty function for getting the :class:`openquake.engine.db.models.OqUser`
-    for the the current user. If the user record doesn't exist, it will be
-    created.
-    """
-    return prepare_user(getpass.getuser())
 
 
 def parse_config(source):
@@ -123,7 +274,7 @@ def parse_config(source):
     base_path = os.path.dirname(
         os.path.join(os.path.abspath('.'), source.name))
     params = dict(base_path=base_path)
-    files = dict()
+    params['inputs'] = dict()
 
     # Directory containing the config file we're parsing.
     base_path = os.path.dirname(os.path.abspath(source.name))
@@ -151,11 +302,21 @@ def parse_config(source):
                     # It's a relative path.
                     path = os.path.join(base_path, path)
 
-                files[key] = path
+                params['inputs'][input_type] = path
             else:
                 params[key] = value
 
-    return params, files
+    # convert back to dict as defaultdict is not pickleable
+    params['inputs'] = dict(params['inputs'])
+
+    # load source inputs (the paths are the source_model_logic_tree)
+    smlt = params['inputs'].get('source_model_logic_tree')
+    if smlt:
+        params['inputs']['source'] = [
+            os.path.join(base_path, src_path)
+            for src_path in _collect_source_model_paths(smlt)]
+
+    return params
 
 
 def _parse_sites_csv(fh):
@@ -177,200 +338,41 @@ def _parse_sites_csv(fh):
     return 'MULTIPOINT(%s)' % ', '.join(coords)
 
 
-def _file_digest(path):
-    """Return a 32 character digest for the file with the given pasth.
-
-    :param str path:
-        File path
-    :returns:
-        A 32 character string with the md5sum digest of the file.
-    """
-    checksum = md5.new()
-    with open(path) as fh:
-        checksum.update(fh.read())
-        return checksum.hexdigest()
-
-
-def _get_content_type(path):
-    """Given the path to a file, guess the content type by looking at the file
-    extension. If there is none, simply return 'unknown'.
-    """
-    _, ext = os.path.splitext(path)
-    if ext == '':
-        return 'unknown'
-    else:
-        # This gives us the . and extension (such as '.xml').
-        # Don't include the period.
-        return ext[1:]
-
-
-def get_or_create_input(path, input_type, owner, name=None,
-                        haz_calc_id=None, risk_calc_id=None):
-    """
-    Get or create an :class:`~openquake.engine.db.models.Input` object for the
-    given file (``path``) associated with a particular calculation. You must
-    specify either ``haz_calc_id`` or ``risk_calc_id``.
-
-    :param str path:
-        Path to the input file.
-    :param str input_type:
-        The type of input. See :class:`openquake.engine.db.models.Input` for
-        a list of valid types.
-    :param owner:
-        The :class:`~openquake.engine.db.models.OqUser` who will own the input
-        that will be created.
-    :param str name:
-        Optional name to help idenfity this input.
-    :param haz_calc_id:
-        ID of a hazard calculation.
-    :param risk_calc_id:
-        ID of a risk calculation.
-    :returns:
-        :class:`openquake.engine.db.models.Input` object to represent the
-        input. As a side effect, this function will also store a full raw copy
-        of the input file
-        (see :class:`openquake.engine.db.models.ModelContent`)
-        and associate it to the `Input`.
-    """
-    assert not [haz_calc_id, risk_calc_id] == [None, None], (
-        "Must specify one of either `haz_calc_id` or `risk_calc_id`."
-    )
-
-    try:
-        # Try to get a preloaded model
-        if haz_calc_id is not None:
-            i2c = models.Input2hcalc.objects.get(
-                hazard_calculation=haz_calc_id,
-                input__path=path,
-                input__input_type=input_type,
-                input__owner=owner,
-            )
-        elif risk_calc_id is not None:
-            i2c = models.Input2rcalc.objects.get(
-                risk_calculation=risk_calc_id,
-                input__path=path,
-                input__input_type=input_type,
-                input__owner=owner,
-            )
-        if name is not None:
-            i2c = i2c.filter(input__name=name)
-        inp = i2c.input
-    except exceptions.ObjectDoesNotExist:
-        # It doesn't exist yet. Let's create it.
-        inp = create_input(path, input_type, owner, name=name)
-
-        # Now that the input is created, associate it with the specified
-        # calculation:
-        if haz_calc_id is not None:
-            hc = models.HazardCalculation.objects.get(id=haz_calc_id)
-            models.Input2hcalc.objects.create(
-                input=inp, hazard_calculation=hc
-            )
-        elif risk_calc_id is not None:
-            rc = models.RiskCalculation.objects.get(id=risk_calc_id)
-            models.Input2rcalc.objects.create(
-                input=inp, risk_calculation=rc
-            )
-
-    return inp
-
-
-def create_input(path, input_type, owner, name=None):
-    """
-    Create a :class:`~openquake.engine.db.models.Input` object from the
-    given file (``path``).
-
-    :param str path:
-        Path to the input file.
-    :param str input_type:
-        The type of input. See :class:`openquake.engine.db.models.Input` for
-        a list of valid types.
-    :param owner:
-        The :class:`~openquake.engine.db.models.OqUser` who will own the input
-        that will be created.
-    :param str name:
-        Optional name to help idenfity this input.
-    :returns:
-        :class:`openquake.engine.db.models.Input` object to represent the
-        input. As a side effect, this function will also store a full raw copy
-        of the input file
-        (see :class:`openquake.engine.db.models.ModelContent`)
-        and associate it to the `Input`.
-    """
-    digest = _file_digest(path)
-
-    with open(path, 'rb') as fh:  # assume UTF-8 encoding
-        zipped = zlib.compress(fh.read())
-        model_content = models.ModelContent(raw_content=zipped)
-    # Try to guess the content type:
-    model_content.content_type = _get_content_type(path)
-    model_content.save()
-
-    inp = models.Input(
-        path=path, input_type=input_type, owner=owner,
-        size=os.path.getsize(path), digest=digest,
-        model_content=model_content, name=name
-    )
-    inp.save()
-    return inp
-
-
-def create_hazard_calculation(username, params, files):
+def create_calculation(model, params):
     """
     Given a params `dict` parsed from the config file, create a
     :class:`~openquake.engine.db.models.HazardCalculation`.
 
-    :param username:
-        Username of the user who will own this calculation profile.
+    :param model:
+        a Calculation class object
     :param dict params:
         Dictionary of parameter names and values. Parameter names should match
         exactly the field names of
         :class:`openquake.engine.db.model.HazardCalculation`.
-    :param list files:
-        List of :class:`~openquake.engine.db.models.Input` objects to be
-        linked to the calculation.
     :returns:
-        :class:`openquake.engine.db.model.HazardCalculation` object.
-        A corresponding record will obviously be saved to the database.
+        an instance of a newly created `model`
     """
-    owner = prepare_user(username)
     if "export_dir" in params:
         params["export_dir"] = os.path.abspath(params["export_dir"])
 
-    haz_calc_fields = models.HazardCalculation._meta.get_all_field_names()
-    for param in set(params) - set(haz_calc_fields):
-        msg = "Unknown parameter '%s'. Ignoring."
-        msg %= param
-        warnings.warn(msg, RuntimeWarning)
-        params.pop(param)
+    calc_fields = model._meta.get_all_field_names()
 
-    hc = models.HazardCalculation(**params)
-    hc.owner = owner
-    hc.full_clean()
-    hc.save()
+    for param in set(params) - set(calc_fields):
+        # FIXME(lp). Django 1.3 does not allow using _id fields in model
+        # __init__. We will check these fields in pre-execute phase
+        if param not in [
+                'preloaded_exposure_model_id', 'hazard_output_id',
+                'hazard_calculation_id']:
+            msg = "Unknown parameter '%s'. Ignoring."
+            msg %= param
+            warnings.warn(msg, RuntimeWarning)
+            params.pop(param)
 
-    # Load the other input files into the database.
-    # This also links the inputs to the calculation via the `input2hcalc`
-    # table.
-    for file_key, input_path in files.iteritems():
-        input_type = file_key[:-5]
-        get_or_create_input(input_path, input_type, owner, haz_calc_id=hc.id)
+    calc = model.create(**params)
+    calc.full_clean()
+    calc.save()
 
-    smlt = files.get('source_model_logic_tree_file')
-    gsimlt = files.get('gsim_logic_tree_file')
-    if not None in (smlt, gsimlt):
-
-        src_paths = _collect_source_model_paths(smlt)
-
-        for src_path in src_paths:
-            get_or_create_input(
-                os.path.join(hc.base_path, src_path),
-                'source',
-                hc.owner,
-                haz_calc_id=hc.id
-            )
-
-    return hc
+    return calc
 
 
 def _collect_source_model_paths(smlt):
@@ -392,39 +394,6 @@ def _collect_source_model_paths(smlt):
     return sorted(list(set(src_paths)))
 
 
-def create_risk_calculation(owner, params, files):
-    """Given a params `dict` parsed from the config file, create a
-    :class:`~openquake.engine.db.models.RiskCalculation`.
-
-    :param owner:
-        The :class:`~openquake.engine.db.models.OqUser` who will own this
-        profile.
-    :param dict params:
-        Dictionary of parameter names and values. Parameter names should match
-        exactly the field names of
-        :class:`openquake.engine.db.model.RiskCalculation`.
-    :param list files:
-        List of :class:`~openquake.engine.db.models.Input` objects to be
-        linked to the calculation.
-    :returns:
-        :class:`openquake.engine.db.model.RiskCalculation` object.
-        A corresponding record will obviously be saved to the database.
-    """
-    if "export_dir" in params:
-        params["export_dir"] = os.path.abspath(params["export_dir"])
-
-    rc = models.RiskCalculation(**params)
-    rc.owner = owner
-    rc.full_clean()
-    rc.save()
-
-    for file_key, input_path in files.iteritems():
-        input_type = file_key[:-5]
-        get_or_create_input(input_path, input_type, owner, risk_calc_id=rc.id)
-
-    return rc
-
-
 def _create_job_stats(job):
     """
     Helper function to create job stats, which implicitly records the start
@@ -437,7 +406,8 @@ def _create_job_stats(job):
 
 
 # used by bin/openquake
-def run_calc(job, log_level, log_file, exports, job_type, supervised=True):
+def run_calc(job, log_level, log_file, exports, job_type,
+             progress_handler=None):
     """
     Run a calculation.
 
@@ -456,114 +426,62 @@ def run_calc(job, log_level, log_file, exports, job_type, supervised=True):
         supported.
     :param str job_type:
         'hazard' or 'risk'
-    :param bool supervised:
-        Defaults to `True`. If `True`, run OpenQuake with a supervisor process,
-        which monitors the job executor process and collects log messages.
+    :param callable progress_handler:
+        a callback getting the progress of the calculation and the calculation
+        object
     """
     calc_mode = getattr(job, '%s_calculation' % job_type).calculation_mode
     calc = get_calculator_class(job_type, calc_mode)(job)
 
+    if progress_handler is not None:
+        calc.register_progress_handler(progress_handler)
+
     # Create job stats, which implicitly records the start time for the job
     _create_job_stats(job)
 
-    # Closing all db connections to make sure they're not shared between
-    # supervisor and job executor processes.
-    # Otherwise, if one of them closes the connection it immediately becomes
-    # unavailable for others.
-    if supervised:
-        django_db.close_connection()
-
-        job_pid = os.fork()
-
-        if not job_pid:
-            # calculation executor process
-            try:
-                _job_exec(job, log_level, log_file, exports, job_type, calc)
-            except Exception, ex:
-                logs.LOG.critical("Calculation failed with exception: '%s'"
-                                  % str(ex))
-                raise
-            finally:
-                job.is_running = False
-                job.save()
-            return
-
-        supervisor_pid = os.fork()
-        if not supervisor_pid:
-            # supervisor process
-            logs.set_logger_level(logs.logging.root, log_level)
-            # TODO: deal with KVS garbage collection
-            supervisor.supervise(job_pid, job.id, log_file=log_file)
-            return
-
-        # parent process
-
-        # ignore Ctrl-C as well as supervisor process does. thus only
-        # job executor terminates on SIGINT
-        supervisor.ignore_sigint()
-        # wait till both child processes are done
-        os.waitpid(job_pid, 0)
-        os.waitpid(supervisor_pid, 0)
-    else:
-        try:
-            _job_exec(job, log_level, log_file, exports, job_type, calc)
-        except Exception, ex:
-            logs.LOG.critical("Calculation failed with exception: '%s'"
-                              % str(ex))
-            raise
-        finally:
-            job.is_running = False
-            job.save()
-            # Normally the supervisor process does this, but since we don't
-            # have one in this case, we have to call the cleanup manually.
-            supervisor.cleanup_after_job(job.id)
-
-    # Refresh the job record, in case we are forking and another process has
-    # modified the job state.
-    return _get_job(job.id)
+    calc_id = job.calculation.id
+    calc_domain = 'hazard' if job.hazard_calculation else 'risk'
+    start_logging(calc_id, calc_domain, log_file)
+    try:
+        with job_stats(job):
+            _job_exec(job, log_level, exports, job_type, calc)
+    except Exception, ex:
+        logs.LOG.critical("Calculation failed with exception: '%s'", ex)
+        raise
+    finally:
+        job.is_running = False
+        job.save()
+        record_job_stop_time(job)
+        cleanup_after_job(job, terminate=TERMINATE)
+    return job
 
 
-def _get_job(job_id):
-    """
-    Helper function to get a job object by ID. Makes testing/mocking easier.
-    """
-    return models.OqJob.objects.get(id=job_id)
-
-
-def _job_exec(job, log_level, log_file, exports, job_type, calc):
+def _job_exec(job, log_level, exports, job_type, calc):
     """
     Abstraction of some general job execution procedures.
 
-    Parameters are the same as :func:`run_calc`, except for ``supervised``
-    which is not included. Also ``calc`` is an instance of the calculator class
+    Parameters are the same as :func:`run_calc`.
+    Also ``calc`` is an instance of the calculator class
     which is passed to :func:`_do_run_calc`.
     """
-    logs.init_logs_amqp_send(level=log_level, calc_domain=job_type,
-                             calc_id=job.calculation.id)
+    logs.init_logs(
+        level=log_level, calc_domain=job_type, calc_id=job.calculation.id)
     # run the job
     job.is_running = True
     job.save()
-    kvs.mark_job_as_current(job.id)
     _do_run_calc(job, exports, calc, job_type)
 
 
 def _switch_to_job_phase(job, ctype, status):
     """Switch to a particular phase of execution.
-
-    This involves creating a `job_phase_stats` record and logging the new
-    status.
-
-    :param job:
-        An :class:`~openquake.engine.db.models.OqJob` instance.
+    :param job: An :class:`~openquake.engine.db.models.OqJob` instance.
     :param str ctype: calculation type (hazard|risk)
     :param str status: one of the following: pre_executing, executing,
         post_executing, post_processing, export, clean_up, complete
     """
     job.status = status
     job.save()
-    models.JobPhaseStats.objects.create(oq_job=job, job_status=status,
-                                        ctype=ctype)
-    logs.LOG.progress("%s (%s)" % (status, ctype))
+    logs.LOG.progress("%s (%s)", status, ctype)
     if status == "executing" and not openquake.engine.no_distribute():
         # Record the compute nodes that were available at the beginning of the
         # execute phase so we can detect failed nodes later.
@@ -586,18 +504,20 @@ def _do_run_calc(job, exports, calc, job_type):
     :returns:
         The input job object when the calculation completes.
     """
-    # - Run the calculation
     _switch_to_job_phase(job, job_type, "pre_executing")
-
+    calc.progress_handler("pre_executing", calc.hc)
     calc.pre_execute()
 
     _switch_to_job_phase(job, job_type, "executing")
+    calc.progress_handler("executing", calc.hc)
     calc.execute()
 
     _switch_to_job_phase(job, job_type, "post_executing")
+    calc.progress_handler("post_executing", calc.hc)
     calc.post_execute()
 
     _switch_to_job_phase(job, job_type, "post_processing")
+    calc.progress_handler("post_processing", calc.hc)
     calc.post_process()
 
     _switch_to_job_phase(job, job_type, "export")
@@ -609,6 +529,7 @@ def _do_run_calc(job, exports, calc, job_type):
     CacheInserter.flushall()  # flush caches into the db
 
     _switch_to_job_phase(job, job_type, "complete")
+    calc.progress_handler("calculation complete", calc.hc)
     logs.LOG.debug("*> complete")
 
     return job
@@ -627,8 +548,8 @@ def del_haz_calc(hc_id):
         raise RuntimeError('Unable to delete hazard calculation: '
                            'ID=%s does not exist' % hc_id)
 
-    user = get_current_user()
-    if hc.owner == user:
+    user = getpass.getuser()
+    if hc.oqjob.user_name == user:
         # we are allowed to delete this
 
         # but first, check if any risk calculations are referencing any of our
@@ -675,8 +596,7 @@ def del_risk_calc(rc_id):
         raise RuntimeError('Unable to delete risk calculation: '
                            'ID=%s does not exist' % rc_id)
 
-    user = get_current_user()
-    if rc.owner == user:
+    if rc.oqjob.user_name == getpass.getuser():
         # we are allowed to delete this
         rc.delete(using='admin')
     else:
@@ -707,22 +627,19 @@ def run_hazard(cfg_file, log_level, log_file, exports):
             cfg_file, getpass.getuser(), log_level, exports
         )
 
-        # Initialize the supervisor, instantiate the calculator,
-        # and run the calculation.
+        # Instantiate the calculator, and run the calculation.
+        t0 = time.time()
         completed_job = run_calc(
             job, log_level, log_file, exports, 'hazard'
         )
-        if completed_job is not None:
-            # We check for `None` here because the supervisor and executor
-            # process forks return to here as well. We want to ignore them.
-            if completed_job.status == 'complete':
-                print 'Calculation %d results:' % (
-                    completed_job.hazard_calculation.id)
-                list_hazard_outputs(completed_job.hazard_calculation.id)
-            else:
-                complain_and_exit('Calculation %d failed'
-                                  % completed_job.hazard_calculation.id,
-                                  exit_code=1)
+        duration = time.time() - t0
+        if completed_job.status == 'complete':
+            print_results(completed_job.hazard_calculation.id,
+                          duration, list_hazard_outputs)
+        else:
+            complain_and_exit('Calculation %d failed'
+                              % completed_job.hazard_calculation.id,
+                              exit_code=1)
     except IOError as e:
         print str(e)
     except Exception as e:
@@ -752,15 +669,13 @@ def haz_job_from_file(cfg_file_path, username, log_level, exports):
     job = prepare_job(user_name=username, log_level=log_level)
 
     # read calculation params and create the calculation profile
-    params, files = parse_config(open(cfg_file_path, 'r'))
-    calculation = create_hazard_calculation(
-        username, params, files
-    )
-    job.hazard_calculation = calculation
+    params = parse_config(open(cfg_file_path, 'r'))
+    job.hazard_calculation = create_calculation(
+        models.HazardCalculation, params)
     job.save()
 
     # validate and raise if there are any problems
-    error_message = validate(job, 'hazard', params, files, exports)
+    error_message = validate(job, 'hazard', params, exports)
     if error_message:
         raise RuntimeError(error_message)
 
@@ -809,6 +724,12 @@ def complain_and_exit(msg, exit_code=0):
     sys.exit(exit_code)
 
 
+def print_results(calc_id, duration, list_outputs):
+    print 'Calculation %d completed in %d seconds. Results:' % (
+        calc_id, duration)
+    list_outputs(calc_id)
+
+
 def print_outputs_summary(outputs):
     """
     List of :class:`openquake.engine.db.models.Output` objects.
@@ -849,22 +770,19 @@ def run_risk(cfg_file, log_level, log_file, exports, hazard_output_id=None,
             hazard_calculation_id
         )
 
-        # Initialize the supervisor, instantiate the calculator,
-        # and run the calculation.
+        # Instantiate the calculator and run the calculation.
+        t0 = time.time()
         completed_job = run_calc(
             job, log_level, log_file, exports, 'risk'
         )
-        if completed_job is not None:
-            # We check for `None` here because the supervisor and executor
-            # process forks return to here as well. We want to ignore them.
-            if completed_job.status == 'complete':
-                print 'Calculation %d results:' % (
-                    completed_job.risk_calculation.id)
-                list_risk_outputs(completed_job.risk_calculation.id)
-            else:
-                complain_and_exit('Calculation %s failed'
-                                  % completed_job.risk_calculation.id,
-                                  exit_code=1)
+        duration = time.time() - t0
+        if completed_job.status == 'complete':
+            print_results(completed_job.risk_calculation.id,
+                          duration, list_risk_outputs)
+        else:
+            complain_and_exit('Calculation %s failed'
+                              % completed_job.risk_calculation.id,
+                              exit_code=1)
     except IOError as e:
         print str(e)
     except Exception as e:
@@ -905,18 +823,16 @@ def risk_job_from_file(cfg_file_path, username, log_level, exports,
     job = prepare_job(user_name=username, log_level=log_level)
 
     # read calculation params and create the calculation profile
-    params, files = parse_config(open(cfg_file_path, 'r'))
+    params = parse_config(open(cfg_file_path, 'r'))
     # Add the hazard output id to the risk calculation constructor args
     params.update(dict(hazard_output_id=hazard_output_id,
                        hazard_calculation_id=hazard_calculation_id))
 
-    calculation = create_risk_calculation(
-        job.owner, params, files
-    )
+    calculation = create_calculation(models.RiskCalculation, params)
     job.risk_calculation = calculation
     job.save()
 
-    error_message = validate(job, 'risk', params, files,  exports)
+    error_message = validate(job, 'risk', params,  exports)
     if error_message:
         raise RuntimeError(error_message)
 

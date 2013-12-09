@@ -31,7 +31,7 @@ AVAILABLE_GSIMS = openquake.hazardlib.gsim.get_available_gsims().keys()
 
 
 # used in bin/openquake
-def validate(job, job_type, params, files, exports):
+def validate(job, job_type, params, exports):
     """
     Validate a job of type 'hazard' or 'risk' by instantiating its
     form class with the given files and exports.
@@ -42,8 +42,6 @@ def validate(job, job_type, params, files, exports):
         "hazard" or "risk"
     :param dict params:
         The raw dictionary of parameters parsed from the config file.
-    :param dict files:
-        {fname: :class:`openquake.engine.db.models.Input` obj}
     :param exports:
         a list of export types
     :returns:
@@ -57,6 +55,8 @@ def validate(job, job_type, params, files, exports):
         form_class = globals()[formname]
     except KeyError:
         return 'Could not find form class for "%s"' % calc_mode
+
+    files = set(params['inputs'])
     form = form_class(instance=calculation, files=files, exports=exports)
 
     # Check for superfluous params and raise warnings:
@@ -103,10 +103,10 @@ class BaseOQModelForm(ModelForm):
     for example, one of the types in :mod:`django.core.files.uploadedfile`.
 
     In this case, however, we expect `files` to be a dict of
-    :class:`openquake.engine.db.models.Input`, keyed by config file parameter
+    filenames, keyed by config file parameter
     for the input. For example::
 
-    {'site_model_file': <Input: 174||site_model||0xdeadbeef||>}
+    {'site_model': 'site_model.xml'}
     """
 
     # These fields require more complex validation.
@@ -115,6 +115,7 @@ class BaseOQModelForm(ModelForm):
     # At the moment, these are common to all hazard calculation modes.
     special_fields = (
         'export_dir',
+        'inputs',
     )
 
     def __init__(self, *args, **kwargs):
@@ -142,9 +143,8 @@ class BaseOQModelForm(ModelForm):
         :returns: True if a vulnerability file has been given
         """
         return [itype
-                for itype, _desc in models.Input.INPUT_TYPE_CHOICES
-                if (itype.endswith('vulnerability') and
-                    "%s_file" % itype in self.files)]
+                for itype, _desc in models.INPUT_TYPE_CHOICES
+                if itype.endswith('vulnerability') and itype in self.files]
 
     def _add_error(self, field_name, error_msg):
         """
@@ -230,6 +230,7 @@ class BaseHazardModelForm(BaseOQModelForm):
         'reference_depth_to_1pt0km_per_sec',
         'reference_kappa',
         'export_dir',
+        'inputs',
     )
 
     def is_valid(self):
@@ -247,8 +248,7 @@ class BaseHazardModelForm(BaseOQModelForm):
             self._add_error('region', err)
         # At least one must be specified (region OR sites)
         elif not (hc.region is not None or
-                  hc.sites is not None or
-                  self.files.get('exposure_file') is not None):
+                  hc.sites is not None or 'exposure' in self.files):
             all_valid = False
             err = 'Must specify either `region`, `sites` or `exposure_file`.'
             self._add_error('region', err)
@@ -275,7 +275,7 @@ class BaseHazardModelForm(BaseOQModelForm):
             all_valid &= valid
             self._add_error('sites', errs)
 
-        if 'site_model_file' not in self.files:
+        if 'site_model' not in self.files:
             # make sure the reference parameters are defined and valid
 
             for field in (
@@ -299,7 +299,6 @@ class ClassicalHazardForm(BaseHazardModelForm):
         model = models.HazardCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region',
             'region_grid_spacing',
             'sites',
@@ -321,6 +320,7 @@ class ClassicalHazardForm(BaseHazardModelForm):
             'quantile_hazard_curves',
             'poes',
             'export_dir',
+            'inputs',
             'hazard_maps',
             'uniform_hazard_spectra',
             'export_multi_curves',
@@ -349,7 +349,6 @@ class EventBasedHazardForm(BaseHazardModelForm):
         model = models.HazardCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region',
             'region_grid_spacing',
             'sites',
@@ -370,14 +369,13 @@ class EventBasedHazardForm(BaseHazardModelForm):
             'ses_per_logic_tree_path',
             'ground_motion_correlation_model',
             'ground_motion_correlation_params',
-            'complete_logic_tree_ses',
-            'complete_logic_tree_gmf',
             'ground_motion_fields',
             'hazard_curves_from_gmfs',
             'mean_hazard_curves',
             'quantile_hazard_curves',
             'poes',
             'export_dir',
+            'inputs',
             'hazard_maps',
             'export_multi_curves',
         )
@@ -389,16 +387,6 @@ class EventBasedHazardForm(BaseHazardModelForm):
         hc = self.instance
 
         # contextual validation
-
-        # It doesn't make sense to capture/export the `complete_logic_tree_gmf`
-        # when we're doing end-branch enumeration:
-        if not hc.number_of_logic_tree_samples and hc.complete_logic_tree_gmf:
-
-            msg = '`%s` is not available with end branch enumeration'
-            msg %= 'complete_logic_tree_gmf'
-            self._add_error('complete_logic_tree_gmf', msg)
-            all_valid = False
-
         # If a vulnerability model is defined, show warnings if the user also
         # specified `intensity_measure_types_and_levels` or
         # `intensity_measure_types`:
@@ -464,7 +452,6 @@ class DisaggHazardForm(BaseHazardModelForm):
         model = models.HazardCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region',
             'region_grid_spacing',
             'sites',
@@ -487,6 +474,7 @@ class DisaggHazardForm(BaseHazardModelForm):
             'num_epsilon_bins',
             'poes_disagg',
             'export_dir',
+            'inputs',
         )
 
     def is_valid(self):
@@ -529,6 +517,7 @@ class ScenarioHazardForm(BaseHazardModelForm):
             'ground_motion_correlation_model',
             'ground_motion_correlation_params',
             'export_dir',
+            'inputs',
         )
 
     def is_valid(self):
@@ -553,7 +542,6 @@ class ClassicalRiskForm(BaseOQModelForm):
         model = models.RiskCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region_constraint',
             'maximum_distance',
             'lrem_steps_per_interval',
@@ -562,6 +550,7 @@ class ClassicalRiskForm(BaseOQModelForm):
             'insured_losses',
             'poes_disagg',
             'export_dir',
+            'inputs',
         )
 
 
@@ -572,13 +561,13 @@ class ClassicalBCRRiskForm(BaseOQModelForm):
         model = models.RiskCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region_constraint',
             'maximum_distance',
             'lrem_steps_per_interval',
             'interest_rate',
             'asset_life_expectancy',
             'export_dir',
+            'inputs',
         )
 
 
@@ -589,7 +578,6 @@ class EventBasedBCRRiskForm(BaseOQModelForm):
         model = models.RiskCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region_constraint',
             'maximum_distance',
             'loss_curve_resolution',
@@ -598,6 +586,7 @@ class EventBasedBCRRiskForm(BaseOQModelForm):
             'interest_rate',
             'asset_life_expectancy',
             'export_dir',
+            'inputs',
         )
 
 
@@ -608,9 +597,9 @@ class EventBasedRiskForm(BaseOQModelForm):
         model = models.RiskCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region_constraint',
             'maximum_distance',
+            'risk_investigation_time',
             'loss_curve_resolution',
             'conditional_loss_poes',
             'insured_losses',
@@ -622,6 +611,7 @@ class EventBasedRiskForm(BaseOQModelForm):
             'distance_bin_width',
             'coordinate_bin_width',
             'export_dir',
+            'inputs',
         )
 
     def is_valid(self):
@@ -649,6 +639,7 @@ class ScenarioDamageRiskForm(BaseOQModelForm):
             'region_constraint',
             'maximum_distance',
             'export_dir',
+            'inputs',
         )
 
 
@@ -659,7 +650,6 @@ class ScenarioRiskForm(BaseOQModelForm):
         model = models.RiskCalculation
         fields = (
             'description',
-            'no_progress_timeout',
             'region_constraint',
             'maximum_distance',
             'master_seed',
@@ -667,13 +657,14 @@ class ScenarioRiskForm(BaseOQModelForm):
             'insured_losses',
             'time_event',
             'export_dir',
+            'inputs',
         )
 
     def is_valid(self):
         super_valid = super(ScenarioRiskForm, self).is_valid()
         rc = self.instance          # RiskCalculation instance
 
-        if 'occupants_vulnerability_file' in self.files:
+        if 'occupants_vulnerability' in self.files:
             if not rc.time_event:
                 self._add_error('time_event', "Scenario Risk requires "
                                 "time_event when an occupants vulnerability "
@@ -726,12 +717,6 @@ def region_is_valid(mdl):
 def region_grid_spacing_is_valid(mdl):
     if not mdl.region_grid_spacing > 0:
         return False, ['Region grid spacing must be > 0']
-    return True, []
-
-
-def no_progress_timeout_is_valid(mdl):
-    if not mdl.no_progress_timeout > 0:
-        return False, ['"No progress" time-out must be > 0']
     return True, []
 
 
@@ -1039,18 +1024,6 @@ def ground_motion_correlation_params_is_valid(_mdl):
     return True, []
 
 
-def complete_logic_tree_ses_is_valid(_mdl):
-    # This parameter is a simple True or False;
-    # field normalization should cover all of validation necessary.
-    return True, []
-
-
-def complete_logic_tree_gmf_is_valid(_mdl):
-    # This parameter is a simple True or False;
-    # field normalization should cover all of validation necessary.
-    return True, []
-
-
 def ground_motion_fields_is_valid(_mdl):
     # This parameter is a simple True or False;
     # field normalization should cover all of validation necessary.
@@ -1216,4 +1189,14 @@ def uniform_hazard_spectra_is_valid(mdl):
 
 def time_event_is_valid(_mdl):
     # Any string is allowed, or `None`.
+    return True, []
+
+
+def risk_investigation_time_is_valid(_mdl):
+    if _mdl.calculation_mode != 'event_based':
+        return False, ['`risk_investigation_time` is only used '
+                       'in event based calculations']
+    if _mdl.risk_investigation_time is not None:
+        if _mdl.risk_investigation_time <= 0:
+            return False, ['Risk investigation time must be > 0']
     return True, []

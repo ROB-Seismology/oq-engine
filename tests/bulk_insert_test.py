@@ -30,10 +30,16 @@ class DummyConnection(object):
     def connection(self):
         return self
 
+    @property
+    def description(self):
+        # a mock to the test insertion in the GmfData table
+        return [['id'], ['gmf_id'], ['ses_id'], ['imt'], ['sa_period'],
+                ['sa_damping'], ['gmvs'], ['rupture_ids'], ['site_id']]
+
     def cursor(self):
         return self
 
-    def execute(self, sql, values):
+    def execute(self, sql, values=()):
         self.sql = sql
         self.values = values
 
@@ -50,7 +56,7 @@ class CacheInserterTestCase(unittest.TestCase):
     def setUp(self):
         self.connections = writer.connections
         writer.connections = dict(
-            admin=DummyConnection(), reslt_writer=DummyConnection())
+            admin=DummyConnection(), job_init=DummyConnection())
 
     def tearDown(self):
         writer.connections = self.connections
@@ -67,7 +73,7 @@ class CacheInserterTestCase(unittest.TestCase):
         cache.add(gmf1)
         cache.add(gmf2)
         cache.flush()
-        connection = writer.connections['reslt_writer']
+        connection = writer.connections['job_init']
         self.assertEqual(
             connection.data,
             '1\t\\N\tPGA\t\\N\t\\N\t{}\t{}\t1\n1\t\\N\tPGA\t\\N\t\\N\t{}\t{}\t2\n')

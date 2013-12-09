@@ -61,8 +61,7 @@ class ClassicalHazardFormTestCase(unittest.TestCase):
     """Tests for classical hazard job param validation."""
 
     def setUp(self):
-        self.hc = models.HazardCalculation(
-            owner=helpers.default_user(),
+        self.hc = models.HazardCalculation.create(
             description='',
             region=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
@@ -179,8 +178,7 @@ class ClassicalHazardFormTestCase(unittest.TestCase):
 
         }
 
-        hc = models.HazardCalculation(
-            owner=helpers.default_user(),
+        hc = models.HazardCalculation.create(
             description='',
             region=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
@@ -314,7 +312,7 @@ class ClassicalHazardFormTestCase(unittest.TestCase):
         # as `intensity_measure_types_and_levels`
         form = validation.ClassicalHazardForm(
             instance=self.hc, files=dict(
-                structural_vulnerability_file=object())
+                structural_vulnerability=object())
         )
 
         with warnings.catch_warnings(record=True) as w:
@@ -335,8 +333,7 @@ class EventBasedHazardFormTestCase(unittest.TestCase):
         subset_iml_imt = VALID_IML_IMT.copy()
         subset_iml_imt.pop('PGA')
 
-        self.hc = models.HazardCalculation(
-            owner=helpers.default_user(),
+        self.hc = models.HazardCalculation.create(
             description='',
             region=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
@@ -363,8 +360,6 @@ class EventBasedHazardFormTestCase(unittest.TestCase):
             ses_per_logic_tree_path=5,
             ground_motion_correlation_model='JB2009',
             ground_motion_correlation_params={"vs30_clustering": True},
-            complete_logic_tree_ses=False,
-            complete_logic_tree_gmf=True,
             ground_motion_fields=True,
             hazard_curves_from_gmfs=True,
             mean_hazard_curves=True,
@@ -463,27 +458,6 @@ class EventBasedHazardFormTestCase(unittest.TestCase):
         equal, err = helpers.deep_eq(expected_errors, dict(form.errors))
         self.assertTrue(equal, err)
 
-    def test_invalid_params_complet_lt_gmf_with_eb_enum(self):
-        # When the `complete_logic_tree_gmf` is requested with end-branch
-        # enumeration, this is not allowed. (The complete LT GMF is not a
-        # useful artifact in this case.)
-        expected_errors = {
-            'complete_logic_tree_gmf': [
-                '`complete_logic_tree_gmf` is not available with end branch '
-                'enumeration'],
-        }
-
-        self.hc.number_of_logic_tree_samples = 0
-        self.hc.complete_logic_tree_gmf = True
-
-        form = validation.EventBasedHazardForm(
-            instance=self.hc, files=None
-        )
-
-        self.assertFalse(form.is_valid())
-        equal, err = helpers.deep_eq(expected_errors, dict(form.errors))
-        self.assertTrue(equal, err)
-
     def test_is_valid_warns(self):
         # `is_valid` should warn if we specify a `vulnerability_file` as well
         # as `intensity_measure_types` and `intensity_measure_types_and_levels`
@@ -496,7 +470,7 @@ class EventBasedHazardFormTestCase(unittest.TestCase):
 
         form = validation.EventBasedHazardForm(
             instance=self.hc, files=dict(
-                structural_vulnerability_file=object())
+                structural_vulnerability=object())
         )
 
         with warnings.catch_warnings(record=True) as w:
@@ -529,11 +503,11 @@ class EventBasedHazardFormTestCase(unittest.TestCase):
         equal, err = helpers.deep_eq(expected_errors, dict(form.errors))
         self.assertTrue(equal, err)
 
+
 class DisaggHazardFormTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.hc = models.HazardCalculation(
-            owner=helpers.default_user(),
+        self.hc = models.HazardCalculation.create(
             description='',
             sites='MULTIPOINT((-122.114 38.113))',
             calculation_mode='disaggregation',
@@ -619,15 +593,13 @@ class DisaggHazardFormTestCase(unittest.TestCase):
         form = validation.DisaggHazardForm(instance=self.hc, files=None)
 
         self.assertFalse(form.is_valid())
-        equal, err = helpers.deep_eq(expected_errors, dict(form.errors))
+        helpers.deep_eq(expected_errors, dict(form.errors))
 
     def test_is_valid_warns(self):
         # `is_valid` should warn if we specify a `vulnerability_file` as well
         # as `intensity_measure_types_and_levels`
         form = validation.DisaggHazardForm(
-            instance=self.hc, files=dict(
-                structural_vulnerability_file=object())
-        )
+            instance=self.hc, files=dict(structural_vulnerability=object()))
 
         with warnings.catch_warnings(record=True) as w:
             form.is_valid()
@@ -644,8 +616,7 @@ class DisaggHazardFormTestCase(unittest.TestCase):
 class ScenarioFormTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.hc = models.HazardCalculation(
-            owner=helpers.default_user(),
+        self.hc = models.HazardCalculation.create(
             description='',
             sites='MULTIPOINT((-122.114 38.113))',
             calculation_mode='scenario',
@@ -691,9 +662,7 @@ openquake.hazardlib.gsim"],
         # `is_valid` should warn if we specify a `vulnerability_file` as well
         # as `intensity_measure_types`
         form = validation.ScenarioHazardForm(
-            instance=self.hc, files=dict(
-                structural_vulnerability_file=object())
-        )
+            instance=self.hc, files=dict(structural_vulnerability=object()))
 
         with warnings.catch_warnings(record=True) as w:
             form.is_valid()
@@ -717,7 +686,6 @@ class ClassicalRiskFormTestCase(unittest.TestCase):
             lrem_steps_per_interval=5)
         self.other_args = dict(
             calculation_mode="classical",
-            owner=helpers.default_user(),
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
                 '-122.0 38.113))'),
@@ -727,7 +695,7 @@ class ClassicalRiskFormTestCase(unittest.TestCase):
         args = dict(self.compulsory_arguments.items())
         args.update(self.other_args)
 
-        rc = models.RiskCalculation(**args)
+        rc = models.RiskCalculation.create(**args)
 
         form = validation.ClassicalRiskForm(
             instance=rc, files=None)
@@ -749,7 +717,7 @@ class ClassicalRiskFormTestCase(unittest.TestCase):
             # then we set other not-compulsory arguments
             arguments.update(self.other_args)
 
-            rc = models.RiskCalculation(**arguments)
+            rc = models.RiskCalculation.create(**arguments)
 
             form = validation.ClassicalRiskForm(instance=rc, files=None)
 
@@ -769,7 +737,6 @@ class ClassicalBCRRiskFormTestCase(unittest.TestCase):
             asset_life_expectancy=40)
 
         self.other_args = dict(
-            owner=helpers.default_user(),
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
                 '-122.0 38.113))'),
@@ -779,7 +746,7 @@ class ClassicalBCRRiskFormTestCase(unittest.TestCase):
         args = dict(self.compulsory_arguments.items())
         args.update(self.other_args)
 
-        rc = models.RiskCalculation(**args)
+        rc = models.RiskCalculation.create(**args)
 
         form = validation.ClassicalBCRRiskForm(
             instance=rc, files=None)
@@ -796,7 +763,7 @@ class ClassicalBCRRiskFormTestCase(unittest.TestCase):
             for field in fields:
                 compulsory_arguments[field] = None
             compulsory_arguments.update(self.other_args)
-            rc = models.RiskCalculation(**compulsory_arguments)
+            rc = models.RiskCalculation.create(**compulsory_arguments)
             form = validation.ClassicalBCRRiskForm(instance=rc, files=None)
 
             self.assertFalse(form.is_valid(), fields)
@@ -816,9 +783,8 @@ class EventBasedBCRRiskForm(unittest.TestCase):
             '-122.57 38.111, -122.0 38.113))'
         )
 
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode="event_based_bcr",
-            owner=helpers.default_user(),
             region_constraint=region_constraint,
             hazard_output=self.job.risk_calculation.hazard_output,
             interest_rate=0.05,
@@ -836,9 +802,8 @@ class EventBasedBCRRiskForm(unittest.TestCase):
             '-122.57 38.111, -122.0 38.113))'
         )
 
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode="event_based_bcr",
-            owner=helpers.default_user(),
             region_constraint=region_constraint,
             hazard_output=self.job.risk_calculation.hazard_output,
         )
@@ -857,9 +822,8 @@ class EventBasedRiskValidationTestCase(unittest.TestCase):
         )
 
     def test_valid_form_with_default_resolution(self):
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode="event_based",
-            owner=helpers.default_user(),
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
                 '-122.0 38.113))'),
@@ -870,9 +834,8 @@ class EventBasedRiskValidationTestCase(unittest.TestCase):
         self.assertTrue(form.is_valid(), dict(form.errors))
 
     def test_valid_form_with_custom_resolution(self):
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode="event_based",
-            owner=helpers.default_user(),
             loss_curve_resolution=60,
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
@@ -884,9 +847,8 @@ class EventBasedRiskValidationTestCase(unittest.TestCase):
         self.assertTrue(form.is_valid(), dict(form.errors))
 
     def test_invalid_form(self):
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode="event_based",
-            owner=helpers.default_user(),
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
                 '-122.0 38.113))'),
@@ -916,9 +878,8 @@ class EventBasedRiskValidationTestCase(unittest.TestCase):
 class ScenarioRiskValidationTestCase(unittest.TestCase):
 
     def test_invalid_form(self):
-        rc = models.RiskCalculation(
+        rc = models.RiskCalculation.create(
             calculation_mode='scenario',
-            owner=helpers.default_user(),
             region_constraint=(
                 'POLYGON((-122.0 38.113, -122.114 38.113, -122.57 38.111, '
                 '-122.0 38.113))'),
@@ -930,14 +891,14 @@ class ScenarioRiskValidationTestCase(unittest.TestCase):
 
         form = validation.ScenarioRiskForm(
             instance=rc,
-            files=dict(occupants_vulnerability_file=object())
+            files=dict(occupants_vulnerability=object())
         )
 
         expected_errors = {
             'asset_correlation': [u'Enter a number.',
                                   u'Asset Correlation must be >= 0 and <= 1'],
-             'time_event': ['Scenario Risk requires time_event when an '
-                            'occupants vulnerability model is given'],
+            'time_event': ['Scenario Risk requires time_event when an '
+                           'occupants vulnerability model is given'],
         }
         self.assertFalse(form.is_valid())
         self.assertEqual(expected_errors, dict(form.errors))
@@ -956,18 +917,17 @@ class ValidateTestCase(unittest.TestCase):
         # warning should be raised.
         cfg_file = helpers.get_data_path('simple_fault_demo_hazard/job.ini')
         job = engine.prepare_job()
-        params, files = engine.parse_config(open(cfg_file, 'r'))
+        params = engine.parse_config(open(cfg_file, 'r'))
         # Add a few superfluous parameters:
         params['ses_per_logic_tree_path'] = 5
         params['ground_motion_correlation_model'] = 'JB2009'
-        calculation = engine.create_hazard_calculation(
-            job.owner.user_name, params, files
-        )
+        calculation = engine.create_calculation(
+            models.HazardCalculation, params)
         job.hazard_calculation = calculation
         job.save()
 
         with warnings.catch_warnings(record=True) as w:
-            validation.validate(job, 'hazard', params, files, ['xml'])
+            validation.validate(job, 'hazard', params, ['xml'])
 
         expected_warnings = [
             "Unknown parameter '%s' for calculation mode 'classical'."

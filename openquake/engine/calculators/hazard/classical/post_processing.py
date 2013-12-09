@@ -80,15 +80,15 @@ def compute_hazard_maps(curves, imls, poes):
     return numpy.array(result).transpose()
 
 
-_HAZ_MAP_DISP_NAME_MEAN_FMT = 'hazard-map(%(poe)s)-%(imt)s-mean'
+_HAZ_MAP_DISP_NAME_MEAN_FMT = 'Mean Hazard map(%(poe)s) %(imt)s'
 _HAZ_MAP_DISP_NAME_QUANTILE_FMT = (
-    'hazard-map(%(poe)s)-%(imt)s-quantile(%(quantile)s)')
+    '%(quantile)s Quantile Hazard Map(%(poe)s) %(imt)s')
 # Hazard maps for a specific end branch
-_HAZ_MAP_DISP_NAME_FMT = 'hazard-map(%(poe)s)-%(imt)s-rlz-%(rlz)s'
+_HAZ_MAP_DISP_NAME_FMT = 'Hazard Map(%(poe)s) %(imt)s rlz-%(rlz)s'
 
-_UHS_DISP_NAME_MEAN_FMT = 'uhs-(%(poe)s)-mean'
-_UHS_DISP_NAME_QUANTILE_FMT = 'uhs-(%(poe)s)-quantile(%(quantile)s)'
-_UHS_DISP_NAME_FMT = 'uhs-(%(poe)s)-rlz-%(rlz)s'
+_UHS_DISP_NAME_MEAN_FMT = 'Mean UHS (%(poe)s)'
+_UHS_DISP_NAME_QUANTILE_FMT = '%(quantile)s Quantile UHS (%(poe)s)'
+_UHS_DISP_NAME_FMT = 'UHS (%(poe)s) rlz-%(rlz)s'
 
 
 # Silencing 'Too many local variables'
@@ -159,13 +159,12 @@ def hazard_curves_to_hazard_map(job_id, hazard_curve_id, poes):
             sa_period=hc.sa_period,
             sa_damping=hc.sa_damping,
             poe=poe,
-            lons=lons,
-            lats=lats,
-            imls=map_values,
+            lons=lons.tolist(),
+            lats=lats.tolist(),
+            imls=map_values.tolist(),
         )
 
 hazard_curves_to_hazard_map_task = tasks.oqtask(hazard_curves_to_hazard_map)
-hazard_curves_to_hazard_map_task.ignore_result = False  # this is essential
 
 
 def hazard_curves_to_hazard_map_task_arg_gen(job):
@@ -299,7 +298,6 @@ def _save_uhs(job, uhs_results, poe, rlz=None, statistics=None, quantile=None):
     """
     output = models.Output(
         oq_job=job,
-        owner=job.owner,
         output_type='uh_spectra'
     )
     uhs = models.UHS(
@@ -324,7 +322,7 @@ def _save_uhs(job, uhs_results, poe, rlz=None, statistics=None, quantile=None):
     # This should fail if neither `lt_realization` nor `statistics` is defined:
     uhs.save()
 
-    with transaction.commit_on_success(using='reslt_writer'):
+    with transaction.commit_on_success(using='job_init'):
         inserter = CacheInserter(models.UHSData, CURVE_CACHE_SIZE)
         for lon, lat, imls in uhs_results['uh_spectra']:
             inserter.add(

@@ -142,8 +142,8 @@ def _export_common(output, loss_type):
                 source_model_tree_path=source_model_tree_path,
                 gsim_tree_path=gsim_tree_path,
                 unit=output.oq_job.risk_calculation.exposure_model.unit(
-                    loss_type))
-
+                    loss_type),
+                loss_type=loss_type)
 
 @core.makedirsdeco
 def export_agg_loss_curve_xml(output, target):
@@ -188,8 +188,8 @@ def _export_loss_map(output, target, writer_class, file_ext):
         loss_category=risk_calculation.exposure_model.category))
     writer = writer_class(dest, **args)
     writer.serialize(
-        output.loss_map.lossmapdata_set.all().order_by('asset_ref')
-    )
+        models.order_by_location(
+            output.loss_map.lossmapdata_set.all().order_by('asset_ref')))
     return dest
 
 

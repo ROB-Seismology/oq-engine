@@ -16,7 +16,7 @@
 
 
 import unittest
-
+import mock
 import openquake.hazardlib
 
 from collections import namedtuple
@@ -35,10 +35,6 @@ class StoreSiteModelTestCase(unittest.TestCase):
 
     def test_store_site_model(self):
         # Setup
-        inp = models.Input(
-            owner=models.OqUser.objects.get(id=1), path='fake_path',
-            digest='fake_digest', input_type='site_model', size=0)
-        inp.save()
         site_model = helpers.get_data_path('site_model.xml')
 
         exp_site_model = [
@@ -54,10 +50,11 @@ class StoreSiteModelTestCase(unittest.TestCase):
                  z1pt0=104.0, z2pt5=5.4),
         ]
 
-        ids = general.store_site_model(inp, site_model)
+        job = models.OqJob.objects.create(user_name="openquake")
+        ids = general.store_site_model(job, site_model)
 
         actual_site_model = models.SiteModel.objects.filter(
-            input=inp.id).order_by('id')
+            job=job).order_by('id')
 
         for i, exp in enumerate(exp_site_model):
             act = actual_site_model[i]
@@ -71,212 +68,19 @@ class StoreSiteModelTestCase(unittest.TestCase):
 
         # last, check that the `store_site_model` function returns all of the
         # newly-inserted records
-        for i, id in enumerate(ids):
-            self.assertEqual(id, actual_site_model[i].id)
-
-
-class ValidateSiteModelTestCase(unittest.TestCase):
-    """Tests for
-    :function:`openquake.engine.calculators.hazard.general.\
-validate_site_model`.
-    """
-
-    @classmethod
-    def setUpClass(cls):
-
-        # This site model has five points, arranged in an X-shaped pattern:
-        #
-        #   a.....b
-        #   .......
-        #   ...c...
-        #   .......
-        #   d.....e
-        cls.site_model_nodes = [
-            models.SiteModel(location='POINT(-10 10)'),
-            models.SiteModel(location='POINT(10 10)'),
-            models.SiteModel(location='POINT(0 0)'),
-            models.SiteModel(location='POINT(-10 -10)'),
-            models.SiteModel(location='POINT(10 -10)'),
-        ]
-
-        # The convex hull of site model geometry
-        # has zero area
-        cls.site_model_degen_case = [
-            models.SiteModel(location='POINT(0.0 0.0)'),
-            models.SiteModel(location='POINT(0.0 0.1)'),
-            models.SiteModel(location='POINT(0.0 0.2)')]
-
-    def test_validate_site_model(self):
-        sites_of_interest_case1 = [
-            # NOTE(larsbutler): Some of the coordinates which are very close to
-            # 10 or -10 have been set to 9.9999999 or -9.9999999 instead.
-            #
-            # This only applies to __longitude__ coordinate values.
-            #
-            # In theory, these cases should work (especially in the case of the
-            # corners), but in reality this is not true. Probably this is due
-            # to the combination of shapely, polygon, upsampling, and the
-            # coordinates chosen for the test case.
-            # Hopefully this test will serve to clearly document some of
-            # the boundary conditions, and also where we can look if unexpected
-            # errors occur.
-
-            # the edges of the polygon
-            # East edge
-            hazardlib_geo.Point(9.9999999, 0),
-            # West edge
-            hazardlib_geo.Point(-9.9999999, 0),
-            # NOTE: The values for the north and south edges were obtained by
-            # trial and error.
-            # North edge
-            hazardlib_geo.Point(0, 10.1507381),
-            # South edge
-            hazardlib_geo.Point(0, -10.1507381),
-            # the corners
-            hazardlib_geo.Point(-10, 10),
-            hazardlib_geo.Point(10, 10),
-            hazardlib_geo.Point(-10, -10),
-            hazardlib_geo.Point(10, -10),
-            # a few points somewhere in the middle, which are obviously inside
-            # the target area
-            hazardlib_geo.Point(0.0, 0.0),
-            hazardlib_geo.Point(-2.5, 2.5),
-            hazardlib_geo.Point(2.5, 2.5),
-            hazardlib_geo.Point(-2.5, -2.5),
-            hazardlib_geo.Point(2.5, -2.5),
-        ]
-
-        sites_of_interest_case2 = [hazardlib_geo.Point(0.0, 0.0),
-                                   hazardlib_geo.Point(0.0, 0.1),
-                                   hazardlib_geo.Point(0.0, 0.2)]
-
-        mesh_case1 = hazardlib_geo.Mesh.from_points_list(
-            sites_of_interest_case1)
-        mesh_case2 = hazardlib_geo.Mesh.from_points_list(
-            sites_of_interest_case2)
-
-        # this should work without raising any errors
-        general.validate_site_model(self.site_model_nodes, mesh_case1)
-        general.validate_site_model(self.site_model_degen_case, mesh_case2)
-
-    def test_validate_site_model_invalid(self):
-        test_cases = [
-            # outside of the edges
-            # East edge
-            [hazardlib_geo.Point(10.0000001, 0)],
-            # West edge
-            [hazardlib_geo.Point(-10.0000001, 0)],
-            # NOTE: The values for the north south edges were obtained by
-            # trial and error.
-            # North edge
-            [hazardlib_geo.Point(0, 10.1507382)],
-            # South edge
-            [hazardlib_geo.Point(0, -10.1507382)],
-            # outside of the corners
-            # first corner (a)
-            [hazardlib_geo.Point(-10.0000001, 10)],
-            [hazardlib_geo.Point(-10, 10.0000001)],
-            # second corner (b)
-            [hazardlib_geo.Point(10.0000001, 10)],
-            [hazardlib_geo.Point(10, 10.0000001)],
-            # third corner (d)
-            [hazardlib_geo.Point(-10.0000001, -10)],
-            [hazardlib_geo.Point(-10, -10.0000001)],
-            # fourth corner (e)
-            [hazardlib_geo.Point(10.0000001, -10)],
-            [hazardlib_geo.Point(10, -10.0000001)],
-        ]
-
-        for tc in test_cases:
-            mesh = hazardlib_geo.Mesh.from_points_list(tc)
-            self.assertRaises(RuntimeError, general.validate_site_model,
-                              self.site_model_nodes, mesh)
-
-
-class GetSiteModelTestCase(unittest.TestCase):
-
-    @classmethod
-    def _create_haz_calc(cls):
-        params = {
-            'base_path': 'a/fake/path',
-            'calculation_mode': 'classical',
-            'region': '1 1 2 2 3 3',
-            'width_of_mfd_bin': '1',
-            'rupture_mesh_spacing': '1',
-            'area_source_discretization': '2',
-            'investigation_time': 50,
-            'truncation_level': 0,
-            'maximum_distance': 200,
-            'number_of_logic_tree_samples': 1,
-            'intensity_measure_types_and_levels': dict(PGA=[1, 2, 3, 4]),
-            'random_seed': 37,
-        }
-        owner = helpers.default_user()
-        hc = engine.create_hazard_calculation(owner.user_name, params, {})
-        return hc
-
-    def test_get_site_model(self):
-        haz_calc = self._create_haz_calc()
-
-        site_model_inp = models.Input(
-            owner=haz_calc.owner, digest='fake', path='fake',
-            input_type='site_model', size=0
-        )
-        site_model_inp.save()
-
-        # The link has not yet been made in the input2haz_calc table.
-        self.assertIsNone(models.get_site_model(haz_calc.id))
-
-        # Complete the link:
-        models.Input2hcalc(
-            input=site_model_inp, hazard_calculation=haz_calc).save()
-
-        actual_site_model = models.get_site_model(haz_calc.id)
-        self.assertEqual(site_model_inp, actual_site_model)
-
-    def test_get_site_model_too_many_site_models(self):
-        haz_calc = self._create_haz_calc()
-
-        site_model_inp1 = models.Input(
-            owner=haz_calc.owner, digest='fake', path='fake',
-            input_type='site_model', size=0
-        )
-        site_model_inp1.save()
-        site_model_inp2 = models.Input(
-            owner=haz_calc.owner, digest='fake', path='fake',
-            input_type='site_model', size=0
-        )
-        site_model_inp2.save()
-
-        # link both site models to the calculation:
-        models.Input2hcalc(
-            input=site_model_inp1, hazard_calculation=haz_calc).save()
-        models.Input2hcalc(
-            input=site_model_inp2, hazard_calculation=haz_calc).save()
-
-        with self.assertRaises(RuntimeError) as assert_raises:
-            models.get_site_model(haz_calc.id)
-
-        self.assertEqual('Only 1 site model per job is allowed, found 2.',
-                         assert_raises.exception.message)
+        for i, s in enumerate(ids):
+            self.assertEqual(s, actual_site_model[i].id)
 
 
 class ClosestSiteModelTestCase(unittest.TestCase):
 
     def setUp(self):
-        owner = engine.prepare_user('openquake')
-        self.site_model_inp = models.Input(
-            owner=owner, digest='fake', path='fake',
-            input_type='site_model', size=0
-        )
-        self.site_model_inp.save()
-
-    def test_get_closest_site_model_data_no_data(self):
-        # We haven't yet linked any site model data to this input, so we
-        # expect a result of `None`.
-        self.assertIsNone(models.get_closest_site_model_data(
-            self.site_model_inp, hazardlib_geo.Point(0, 0))
-        )
+        self.hc = models.HazardCalculation.objects.create(
+            maximum_distance=200,
+            calculation_mode="classical",
+            inputs={'site_model': ['fake']})
+        self.job = models.OqJob.objects.create(
+            user_name="openquake", hazard_calculation=self.hc)
 
     def test_get_closest_site_model_data(self):
         # This test scenario is the following:
@@ -293,12 +97,12 @@ class ClosestSiteModelTestCase(unittest.TestCase):
         #  d        s s        d
 
         sm1 = models.SiteModel(
-            input=self.site_model_inp, vs30_type='measured', vs30=0.0000001,
+            job=self.job, vs30_type='measured', vs30=0.0000001,
             z1pt0=0.0000001, z2pt5=0.0000001, location='POINT(-1 0)'
         )
         sm1.save()
         sm2 = models.SiteModel(
-            input=self.site_model_inp, vs30_type='inferred', vs30=0.0000002,
+            job=self.job, vs30_type='inferred', vs30=0.0000002,
             z1pt0=0.0000002, z2pt5=0.0000002, location='POINT(1 0)'
         )
         sm2.save()
@@ -313,8 +117,8 @@ class ClosestSiteModelTestCase(unittest.TestCase):
         point1 = hazardlib_geo.Point(-0.0000001, 0)
         point2 = hazardlib_geo.Point(0.0000001, 0)
 
-        res1 = models.get_closest_site_model_data(self.site_model_inp, point1)
-        res2 = models.get_closest_site_model_data(self.site_model_inp, point2)
+        res1 = self.hc.get_closest_site_model_data(point1)
+        res2 = self.hc.get_closest_site_model_data(point2)
 
         self.assertEqual(sm1, res1)
         self.assertEqual(sm2, res2)
@@ -364,15 +168,14 @@ class ParseRiskModelsTestCase(unittest.TestCase):
         # check that if risk models are provided, then the ``points to
         # compute`` and the imls are got from there
 
-        username = helpers.default_user().user_name
+        username = helpers.default_user()
 
         job = engine.prepare_job(username)
 
         cfg = helpers.get_data_path('classical_job-sd-imt.ini')
-        params, files = engine.parse_config(open(cfg, 'r'))
+        params = engine.parse_config(open(cfg, 'r'))
 
-        haz_calc = engine.create_hazard_calculation(
-            job.owner.user_name, params, files)
+        haz_calc = engine.create_calculation(models.HazardCalculation, params)
         haz_calc = models.HazardCalculation.objects.get(id=haz_calc.id)
         job.hazard_calculation = haz_calc
         job.is_running = True
@@ -386,12 +189,7 @@ class ParseRiskModelsTestCase(unittest.TestCase):
             '%s.%s' % (base_path, 'initialize_site_model'))
         init_rlz_patch = helpers.patch(
             '%s.%s' % (base_path, 'initialize_realizations'))
-        record_stats_patch = helpers.patch(
-            '%s.%s' % (base_path, 'record_init_stats'))
-        init_pr_data_patch = helpers.patch(
-            '%s.%s' % (base_path, 'initialize_pr_data'))
-        patches = (init_src_patch, init_sm_patch, init_rlz_patch,
-                   record_stats_patch, init_pr_data_patch)
+        patches = (init_src_patch, init_sm_patch, init_rlz_patch)
 
         mocks = [p.start() for p in patches]
 
@@ -404,7 +202,8 @@ class ParseRiskModelsTestCase(unittest.TestCase):
                           for point in haz_calc.points_to_compute()])
         self.assertEqual(['PGA'], haz_calc.get_imts())
 
-        self.assertEqual(3, haz_calc.exposure_model.exposuredata_set.count())
+        self.assertEqual(
+            3, haz_calc.oqjob.exposuremodel.exposuredata_set.count())
 
         for i, m in enumerate(mocks):
             m.stop()
@@ -420,12 +219,12 @@ class TaskArgGenTestCase(unittest.TestCase):
     The default implementation splits the calculation into blocks of sources.
     """
 
-    Job = namedtuple('Job', 'id')
+    Job = namedtuple('Job', 'id hazard_calculation')
     Rlz = namedtuple('Realization', 'id')
 
     def test_task_arg_gen(self):
         # Test the logic of `BaseHazardCalculator.task_arg_gen`.
-        job = self.Job(1776)
+        job = self.Job(1776, mock.Mock())
 
         base_path = (
             'openquake.engine.calculators.hazard.general.BaseHazardCalculator'
@@ -433,6 +232,12 @@ class TaskArgGenTestCase(unittest.TestCase):
         calc = general.BaseHazardCalculator(job)
 
         # Set up mocks:
+        # ltp
+        ltp_patch = mock.patch(
+            'openquake.engine.input.logictree.LogicTreeProcessor.from_hc')
+        ltp_mock = ltp_patch.start()
+        ltp_mock.return_value = mock.Mock()
+
         # point_source_block_size
         pt_src_block_size_patch = helpers.patch(
             '%s.%s' % (base_path, 'point_source_block_size')
@@ -445,19 +250,17 @@ class TaskArgGenTestCase(unittest.TestCase):
             '%s.%s' % (base_path, '_get_realizations')
         )
         get_rlz_mock = get_rlz_patch.start()
-        get_rlz_mock.return_value = [self.Rlz(5), self.Rlz(6)]
 
-        # _get_point_source_ids
-        get_pt_patch = helpers.patch(
-            '%s.%s' % (base_path, '_get_point_source_ids')
-        )
-        get_pt_mock = get_pt_patch.start()
-        get_pt_mock.return_value = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        r5, r6 = self.Rlz(5), self.Rlz(6)
+        get_rlz_mock.return_value = [r5, r6]
 
-        # _get_source_ids
-        get_src_patch = helpers.patch('%s.%s' % (base_path, '_get_source_ids'))
-        get_src_mock = get_src_patch.start()
-        get_src_mock.return_value = [100, 101, 102, 103, 104]
+        calc.rlz_to_sm = {r5: 'dummy_sm', r6: 'dummy_sm'}
+
+        for rlz in (r5, r6):
+            calc.sources_per_model['dummy_sm', 'point'] = [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            calc.sources_per_model['dummy_sm', 'other'] = [
+                100, 101, 102, 103, 104]
 
         expected = [
             (1776, [1, 2, 3, 4, 5], 5),
@@ -474,23 +277,16 @@ class TaskArgGenTestCase(unittest.TestCase):
             (1776, [104], 6),
         ]
 
+        expected = [exp + (ltp_mock.return_value,) for exp in expected]
+
         try:
-            actual = list(calc.task_arg_gen(
-                          block_size=2, check_num_task=False))
+            actual = list(calc.task_arg_gen(block_size=2))
             self.assertEqual(expected, actual)
-        finally:
             self.assertEqual(1, pt_src_block_size_mock.call_count)
+            self.assertEqual(1, get_rlz_mock.call_count)
+        finally:
             pt_src_block_size_mock.stop()
             pt_src_block_size_patch.stop()
-
-            self.assertEqual(1, get_rlz_mock.call_count)
             get_rlz_mock.stop()
             get_rlz_patch.stop()
-
-            self.assertEqual(2, get_pt_mock.call_count)
-            get_pt_mock.stop()
-            get_pt_patch.stop()
-
-            self.assertEqual(2, get_src_mock.call_count)
-            get_src_mock.stop()
-            get_src_patch.stop()
+            ltp_patch.stop()
