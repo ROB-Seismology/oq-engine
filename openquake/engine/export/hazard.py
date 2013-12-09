@@ -148,9 +148,10 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
 #                filename = '%s-smltp_%s-gsimltp_%s.%s' % (
 #                    output_type, sm_ltp, gsim_ltp, file_ext
 #                )
-            n = len(str(output.oq_job.calculation.number_of_logic_tree_samples))
-            nformat = '%%0%dd' % n
-            filename = output_type + '_' + nformat % ltr.ordinal + '.' + file_ext
+            n_rlzs = len(str(output.oq_job.calculation.number_of_logic_tree_samples))
+            rlz_n_format = '%%0%dd' % n_rlzs
+            rlz_n = rlz_n_format % ltr.ordinal+1
+            filename =  + '%s-rlz-%s.%s' % (output_type, rlz_n, file_ext)
     elif output_type in ('gmf', 'ses'):
         # only logic trees, no stats
         ltr = result.lt_realization

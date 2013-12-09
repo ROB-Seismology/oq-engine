@@ -228,6 +228,7 @@ class BaseHazardModelForm(BaseOQModelForm):
         'reference_vs30_type',
         'reference_depth_to_2pt5km_per_sec',
         'reference_depth_to_1pt0km_per_sec',
+        'reference_kappa',
         'export_dir',
     )
 
@@ -312,6 +313,7 @@ class ClassicalHazardForm(BaseHazardModelForm):
             'reference_vs30_type',
             'reference_depth_to_2pt5km_per_sec',
             'reference_depth_to_1pt0km_per_sec',
+            'reference_kappa',
             'investigation_time',
             'truncation_level',
             'maximum_distance',
