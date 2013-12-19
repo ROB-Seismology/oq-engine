@@ -171,16 +171,20 @@ def _get_result_export_dest(calc_id, target, result, file_ext='xml'):
         ltr = result.lt_realization
         sm_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.sm_lt_path)
         gsim_ltp = core.LT_PATH_JOIN_TOKEN.join(ltr.gsim_lt_path)
-        if ltr.weight is None:
-            # Monte-Carlo logic tree sampling
-            filename = '%s-%s-smltp_%s-gsimltp_%s-ltr_%s.%s' % (
-                out, location, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
-            )
-        else:
-            # End Branch Enumeration
-            filename = '%s-%s-smltp_%s-gsimltp_%s.%s' % (
-                out, location, sm_ltp, gsim_ltp, file_ext
-            )
+#        if ltr.weight is None:
+#            # Monte-Carlo logic tree sampling
+#            filename = '%s-%s-smltp_%s-gsimltp_%s-ltr_%s.%s' % (
+#                out, location, sm_ltp, gsim_ltp, ltr.ordinal, file_ext
+#            )
+#        else:
+#            # End Branch Enumeration
+#            filename = '%s-%s-smltp_%s-gsimltp_%s.%s' % (
+#                out, location, sm_ltp, gsim_ltp, file_ext
+#            )
+        n_rlzs = len(str(output.oq_job.calculation.number_of_logic_tree_samples))
+        rlz_n_format = '%%0%dd' % n_rlzs
+        rlz_n = rlz_n_format % (ltr.ordinal + 1)
+        filename = '%s-%s-rlz-%s.%s' % (out, location, rlz_n, file_ext)
     else:
         filename = '%s.%s' % (output_type, file_ext)
 
@@ -511,11 +515,15 @@ def export_disagg_matrix_xml(output, target):
         gsimlt_path=core.LT_PATH_JOIN_TOKEN.join(lt_rlz.gsim_lt_path),
     )
 
-    writer = writers.DisaggXMLWriter(dest, **writer_kwargs)
-
-    data = (_DisaggMatrix(pmf_fn(disagg_result.matrix), dim_labels,
-                          disagg_result.poe, disagg_result.iml)
-            for dim_labels, pmf_fn in pmf_map.iteritems())
+    if hasattr(output, "full") and output.full:
+        writer = writers.DisaggFullMatrixXMLWriter(dest, **writer_kwargs)
+        disagg_result.dim_labels = ('Mag', 'Dist', 'Lon', 'Lat', 'Eps', 'TRT')
+        data = disagg_result
+    else:
+        writer = writers.DisaggXMLWriter(dest, **writer_kwargs)
+        data = (_DisaggMatrix(pmf_fn(disagg_result.matrix), dim_labels,
+                              disagg_result.poe, disagg_result.iml)
+                for dim_labels, pmf_fn in pmf_map.iteritems())
 
     writer.serialize(data)
 
