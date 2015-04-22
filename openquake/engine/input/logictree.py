@@ -316,6 +316,10 @@ class BranchSet(object):
             elif self.uncertainty_type == 'maxMagGRAbsolute':
                 mfd.modify('set_max_mag', dict(value=value))
 
+            else:
+                raise AssertionError('unknown or inappropriate uncertainty type %r'
+                                     % self.uncertainty_type)
+
         elif isinstance(mfd, openquake.hazardlib.mfd.EvenlyDiscretizedMFD):
             if self.uncertainty_type == 'incrementalMFDRates':
                 mfd.modify('set_occurrence_rates', dict(occurrence_rates=value))
@@ -323,9 +327,9 @@ class BranchSet(object):
             elif self.uncertainty_type == 'maxMagGRAbsolute':
                 mfd.modify('set_max_mag', dict(value=value))
 
-        else:
-            raise AssertionError('unknown or inappropriate uncertainty type %r'
-                                 % self.uncertainty_type)
+            else:
+                raise AssertionError('unknown or inappropriate uncertainty type %r'
+                                     % self.uncertainty_type)
 
 
 class BaseLogicTree(object):
